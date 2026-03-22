@@ -1,5 +1,12 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import torch
+try:
+    import torch_npu
+    npu_available = True
+except:
+    npu_available = False
+import os
+import math
 import torch.nn as nn
 from einops import rearrange, repeat
 from ..utils.multitalk_utils import RotaryPositionalEmbedding1D, normalize_and_scale, split_token_counts_and_frame_ids
@@ -8,19 +15,24 @@ from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
     get_sp_group,
 )
-import xformers.ops
+# from wan.distributed.parallel_mgr import (
+#         get_sequence_parallel_rank,
+#         get_sequence_parallel_world_size,
+#         get_sp_group,
+#     )
+# import xformers.ops
 
-try:
-    import flash_attn_interface
-    FLASH_ATTN_3_AVAILABLE = True
-except ModuleNotFoundError:
-    FLASH_ATTN_3_AVAILABLE = False
+# try:
+#     import flash_attn_interface
+#     FLASH_ATTN_3_AVAILABLE = True
+# except ModuleNotFoundError:
+#     FLASH_ATTN_3_AVAILABLE = False
 
-try:
-    import flash_attn
-    FLASH_ATTN_2_AVAILABLE = True
-except ModuleNotFoundError:
-    FLASH_ATTN_2_AVAILABLE = False
+# try:
+#     import flash_attn
+#     FLASH_ATTN_2_AVAILABLE = True
+# except ModuleNotFoundError:
+#     FLASH_ATTN_2_AVAILABLE = False
 
 import warnings
 
@@ -28,7 +40,7 @@ __all__ = [
     'flash_attention',
     'attention',
 ]
-
+MAX_TOKEN=2147483647
 
 def flash_attention(
     q,
@@ -60,7 +72,8 @@ def flash_attention(
     """
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
-    assert q.device.type == 'cuda' and q.size(-1) <= 256
+    # assert q.device.type == 'cuda' and q.size(-1) <= 256
+    assert q.device.type == 'npu' and q.size(-1) <= 256
 
     # params
     b, lq, lk, out_dtype = q.size(0), q.size(1), k.size(1), q.dtype
@@ -94,46 +107,80 @@ def flash_attention(
     if q_scale is not None:
         q = q * q_scale
 
-    if version is not None and version == 3 and not FLASH_ATTN_3_AVAILABLE:
-        warnings.warn(
-            'Flash attention 3 is not available, use flash attention 2 instead.'
-        )
+    # if version is not None and version == 3 and not FLASH_ATTN_3_AVAILABLE:
+    #     warnings.warn(
+    #         'Flash attention 3 is not available, use flash attention 2 instead.'
+    #     )
 
     # apply attention
-    if (version is None or version == 3) and FLASH_ATTN_3_AVAILABLE:
-        # Note: dropout_p, window_size are not supported in FA3 now.
-        x = flash_attn_interface.flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
-            cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
-            seqused_q=None,
-            seqused_k=None,
-            max_seqlen_q=lq,
-            max_seqlen_k=lk,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            deterministic=deterministic)[0].unflatten(0, (b, lq))
+    # if (version is None or version == 3) and FLASH_ATTN_3_AVAILABLE:
+    #     Note: dropout_p, window_size are not supported in FA3 now.
+    #     x = flash_attn_interface.flash_attn_varlen_func(
+    #         q=q,
+    #         k=k,
+    #         v=v,
+    #         cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(
+    #             0, dtype=torch.int32).to(q.device, non_blocking=True),
+    #         cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(
+    #             0, dtype=torch.int32).to(q.device, non_blocking=True),
+    #         seqused_q=None,
+    #         seqused_k=None,
+    #         max_seqlen_q=lq,
+    #         max_seqlen_k=lk,
+    #         softmax_scale=softmax_scale,
+    #         causal=causal,
+    #         deterministic=deterministic)[0].unflatten(0, (b, lq))
+    if version is None:
+        version = 3
+    head_num = q.shape[1]
+    cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(0, dtype=torch.int32).to(q.device, non_blocking=True)
+    cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(0, dtype=torch.int32).to(q.device, non_blocking=True)
+    if causal:
+        atten_mask_npu = torch.triu(torch.ones([2048, 2048]), diagonal=1).bool().to(q.device)
+        output = torch_npu.npu_fusion_attention(
+                    q, k, v, head_num,
+                    pse=None,
+                    padding_mask=None,
+                    atten_mask=atten_mask_npu,
+                    scale=1.0 / math.sqrt(q.shape[-1]),
+                    keep_prob=1,
+                    input_layout="BSND",
+                    actual_seq_qlen=tuple(cu_seqlens_q[1:].cpu().numpy().tolist()),
+                    actual_seq_kvlen=tuple(cu_seqlens_k[1:].cpu().numpy().tolist()),
+                    sparse_mode=version)[0]
     else:
-        assert FLASH_ATTN_2_AVAILABLE
-        x = flash_attn.flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
-            cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
-            max_seqlen_q=lq,
-            max_seqlen_k=lk,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            deterministic=deterministic).unflatten(0, (b, lq))
+        # print(f"DEBUG ---------------------------- Q shape: {q.shape}")
+        head_num = q.shape[1]
+        x = torch_npu.npu_fusion_attention(
+            q, k, v, head_num,
+            pse=None,
+            atten_mask=None,
+            scale=1.0 / math.sqrt(q.shape[-1]),
+            keep_prob=1,
+            input_layout="TND",
+            actual_seq_qlen=tuple(cu_seqlens_q[1:].cpu().numpy().tolist()),
+            actual_seq_kvlen=tuple(cu_seqlens_k[1:].cpu().numpy().tolist()))[0]
+        # # # 试试我的
+        # head_num = q.shape[2]
+        # x = torch_npu.npu_fusion_attention(q, k, v, head_num, "BSH", keep_prob=1.0)[0]
+
+    # else:
+    #     # assert FLASH_ATTN_2_AVAILABLE
+    #     x = flash_attn.flash_attn_varlen_func(
+    #         q=q,
+    #         k=k,
+    #         v=v,
+    #         cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(
+    #             0, dtype=torch.int32).to(q.device, non_blocking=True),
+    #         cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(
+    #             0, dtype=torch.int32).to(q.device, non_blocking=True),
+    #         max_seqlen_q=lq,
+    #         max_seqlen_k=lk,
+    #         dropout_p=dropout_p,
+    #         softmax_scale=softmax_scale,
+    #         causal=causal,
+    #         window_size=window_size,
+    #         deterministic=deterministic).unflatten(0, (b, lq))
 
     # output
     return x.type(out_dtype)
@@ -154,52 +201,52 @@ def attention(
     dtype=torch.bfloat16,
     fa_version=None,
 ):
-    if FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE:
-        return flash_attention(
-            q=q,
-            k=k,
-            v=v,
-            q_lens=q_lens,
-            k_lens=k_lens,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            q_scale=q_scale,
-            causal=causal,
-            window_size=window_size,
-            deterministic=deterministic,
-            dtype=dtype,
-            version=fa_version,
-        )
-    else:
-        if q_lens is not None or k_lens is not None:
-            warnings.warn(
-                'Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance.'
-            )
-        attn_mask = None
+    # if FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE:
+    return flash_attention(
+        q=q,
+        k=k,
+        v=v,
+        q_lens=q_lens,
+        k_lens=k_lens,
+        dropout_p=dropout_p,
+        softmax_scale=softmax_scale,
+        q_scale=q_scale,
+        causal=causal,
+        window_size=window_size,
+        deterministic=deterministic,
+        dtype=dtype,
+        version=fa_version,
+    )
+    # else:
+    #     if q_lens is not None or k_lens is not None:
+    #         warnings.warn(
+    #             'Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance.'
+    #         )
+    #     attn_mask = None
 
-        q = q.transpose(1, 2).to(dtype)
-        k = k.transpose(1, 2).to(dtype)
-        v = v.transpose(1, 2).to(dtype)
+    #     q = q.transpose(1, 2).to(dtype)
+    #     k = k.transpose(1, 2).to(dtype)
+    #     v = v.transpose(1, 2).to(dtype)
 
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
+    #     out = torch.nn.functional.scaled_dot_product_attention(
+    #         q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
 
-        out = out.transpose(1, 2).contiguous()
-        return out
-    
+    #     out = out.transpose(1, 2).contiguous()
+    #     return out
+
 
 class SingleStreamAttention(nn.Module):
     def __init__(
-        self,
-        dim: int,
-        encoder_hidden_states_dim: int,
-        num_heads: int,
-        qkv_bias: bool,
-        qk_norm: bool,
-        norm_layer: nn.Module,
-        attn_drop: float = 0.0,
-        proj_drop: float = 0.0,
-        eps: float = 1e-6,
+            self,
+            dim: int,
+            encoder_hidden_states_dim: int,
+            num_heads: int,
+            qkv_bias: bool,
+            qk_norm: bool,
+            norm_layer: nn.Module,
+            attn_drop: float = 0.0,
+            proj_drop: float = 0.0,
+            eps: float = 1e-6,
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0, "dim should be divisible by num_heads"
@@ -207,13 +254,13 @@ class SingleStreamAttention(nn.Module):
         self.encoder_hidden_states_dim = encoder_hidden_states_dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.scale = self.head_dim**-0.5
+        self.scale = self.head_dim ** -0.5
         self.qk_norm = qk_norm
 
         self.q_linear = nn.Linear(dim, dim, bias=qkv_bias)
 
         self.q_norm = norm_layer(self.head_dim, eps=eps) if qk_norm else nn.Identity()
-        self.k_norm = norm_layer(self.head_dim,eps=eps) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim, eps=eps) if qk_norm else nn.Identity()
 
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
@@ -224,8 +271,9 @@ class SingleStreamAttention(nn.Module):
         self.add_q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.add_k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
 
-    def forward(self, x: torch.Tensor, encoder_hidden_states: torch.Tensor, shape=None, enable_sp=False, kv_seq=None) -> torch.Tensor:
-       
+    def forward(self, x: torch.Tensor, encoder_hidden_states: torch.Tensor, shape=None, enable_sp=False,
+                kv_seq=None) -> torch.Tensor:
+
         N_t, N_h, N_w = shape
         if not enable_sp:
             x = rearrange(x, "B (N_t S) C -> (B N_t) S C", N_t=N_t)
@@ -238,38 +286,81 @@ class SingleStreamAttention(nn.Module):
 
         if self.qk_norm:
             q = self.q_norm(q)
-        
+
         # get kv from encoder_hidden_states
         _, N_a, _ = encoder_hidden_states.shape
         encoder_kv = self.kv_linear(encoder_hidden_states)
         encoder_kv_shape = (B, N_a, 2, self.num_heads, self.head_dim)
-        encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4)) 
+        encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4))
         encoder_k, encoder_v = encoder_kv.unbind(0)
 
         if self.qk_norm:
             encoder_k = self.add_k_norm(encoder_k)
 
+        if npu_available:
+            B, H, M, K = q.shape
+            q = rearrange(q, "B H M K -> (B M) H K")
+            encoder_k = rearrange(encoder_k, "B H M K -> (B M) H K")
+            encoder_v = rearrange(encoder_v, "B H M K -> (B M) H K")
 
-        q = rearrange(q, "B H M K -> B M H K")
-        encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
-        encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
+            if enable_sp:
+                # context parallel
+                sp_size = get_sequence_parallel_world_size()
+                sp_rank = get_sequence_parallel_rank()
+                visual_seqlen, _ = split_token_counts_and_frame_ids(N_t, N_h * N_w, sp_size, sp_rank)
+                assert kv_seq is not None, f"kv_seq should not be None."
 
-        if enable_sp:
-            # context parallel
-            sp_size = get_sequence_parallel_world_size()
-            sp_rank = get_sequence_parallel_rank()
-            visual_seqlen, _ = split_token_counts_and_frame_ids(N_t, N_h * N_w, sp_size, sp_rank)
-            assert kv_seq is not None, f"kv_seq should not be None."
-            attn_bias = xformers.ops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(visual_seqlen, kv_seq)
+                actual_seq_qlen, actual_seq_kvlen = [], []
+
+                for i in visual_seqlen:
+                    if len(actual_seq_qlen) == 0:
+                        actual_seq_qlen.append(i)
+                    else:
+                        actual_seq_qlen.append(actual_seq_qlen[-1] + i)
+
+                for i in kv_seq:
+                    if len(actual_seq_kvlen) == 0:
+                        actual_seq_kvlen.append(i)
+                    else:
+                        actual_seq_kvlen.append(actual_seq_kvlen[-1] + i)
+            else:
+                actual_seq_qlen, actual_seq_kvlen = None, None
+
+            x = torch_npu.npu_fusion_attention(
+                q, encoder_k, encoder_v, self.num_heads, input_layout="TND",
+                pse=None,
+                atten_mask=None,
+                scale=self.head_dim ** -0.5,
+                keep_prob=1.,
+                sync=False,
+                inner_precise=0,
+                actual_seq_qlen=actual_seq_qlen,
+                actual_seq_kvlen=actual_seq_kvlen
+            )[0]
+
+            x = rearrange(x, "(B M) H K -> B M (H K)", B=B, M=M, H=H, K=K)
         else:
-            attn_bias = None
-        x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=attn_bias, op=None,)
-        x = rearrange(x, "B M H K -> B H M K") 
+            q = rearrange(q, "B H M K -> B M H K")
+            encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
+            encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
 
-        # linear transform
-        x_output_shape = (B, N, C)
-        x = x.transpose(1, 2) 
-        x = x.reshape(x_output_shape) 
+            if enable_sp:
+                # context parallel
+                sp_size = get_sequence_parallel_world_size()
+                sp_rank = get_sequence_parallel_rank()
+                visual_seqlen, _ = split_token_counts_and_frame_ids(N_t, N_h * N_w, sp_size, sp_rank)
+                assert kv_seq is not None, f"kv_seq should not be None."
+                attn_bias = xformers.ops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(visual_seqlen, kv_seq)
+            else:
+                attn_bias = None
+            x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=attn_bias, op=None, )
+
+            x = rearrange(x, "B M H K -> B H M K")
+
+            # linear transform
+            x_output_shape = (B, N, C)
+            x = x.transpose(1, 2)
+            x = x.reshape(x_output_shape)
         x = self.proj(x)
         x = self.proj_drop(x)
 
@@ -279,20 +370,21 @@ class SingleStreamAttention(nn.Module):
 
         return x
 
+
 class SingleStreamMutiAttention(SingleStreamAttention):
     def __init__(
-        self,
-        dim: int,
-        encoder_hidden_states_dim: int,
-        num_heads: int,
-        qkv_bias: bool,
-        qk_norm: bool,
-        norm_layer: nn.Module,
-        attn_drop: float = 0.0,
-        proj_drop: float = 0.0,
-        eps: float = 1e-6,
-        class_range: int = 24,
-        class_interval: int = 4,
+            self,
+            dim: int,
+            encoder_hidden_states_dim: int,
+            num_heads: int,
+            qkv_bias: bool,
+            qk_norm: bool,
+            norm_layer: nn.Module,
+            attn_drop: float = 0.0,
+            proj_drop: float = 0.0,
+            eps: float = 1e-6,
+            class_range: int = 24,
+            class_interval: int = 4,
     ) -> None:
         super().__init__(
             dim=dim,
@@ -307,87 +399,97 @@ class SingleStreamMutiAttention(SingleStreamAttention):
         )
         self.class_interval = class_interval
         self.class_range = class_range
-        self.rope_h1  = (0, self.class_interval)
-        self.rope_h2  = (self.class_range - self.class_interval, self.class_range)
+        self.rope_h1 = (0, self.class_interval)
+        self.rope_h2 = (self.class_range - self.class_interval, self.class_range)
         self.rope_bak = int(self.class_range // 2)
 
         self.rope_1d = RotaryPositionalEmbedding1D(self.head_dim)
 
-    def forward(self, 
-                x: torch.Tensor, 
-                encoder_hidden_states: torch.Tensor, 
-                shape=None, 
+    def forward(self,
+                x: torch.Tensor,
+                encoder_hidden_states: torch.Tensor,
+                shape=None,
                 x_ref_attn_map=None,
                 human_num=None) -> torch.Tensor:
-        
+
         encoder_hidden_states = encoder_hidden_states.squeeze(0)
         if human_num == 1:
             return super().forward(x, encoder_hidden_states, shape)
 
-        N_t, _, _ = shape 
-        x = rearrange(x, "B (N_t S) C -> (B N_t) S C", N_t=N_t) 
+        N_t, _, _ = shape
+        x = rearrange(x, "B (N_t S) C -> (B N_t) S C", N_t=N_t)
 
         # get q for hidden_state
         B, N, C = x.shape
-        q = self.q_linear(x) 
-        q_shape = (B, N, self.num_heads, self.head_dim) 
+        q = self.q_linear(x)
+        q_shape = (B, N, self.num_heads, self.head_dim)
         q = q.view(q_shape).permute((0, 2, 1, 3))
 
         if self.qk_norm:
             q = self.q_norm(q)
 
-  
-        max_values = x_ref_attn_map.max(1).values[:, None, None] 
-        min_values = x_ref_attn_map.min(1).values[:, None, None] 
+        max_values = x_ref_attn_map.max(1).values[:, None, None]
+        min_values = x_ref_attn_map.min(1).values[:, None, None]
         max_min_values = torch.cat([max_values, min_values], dim=2)
 
         human1_max_value, human1_min_value = max_min_values[0, :, 0].max(), max_min_values[0, :, 1].min()
         human2_max_value, human2_min_value = max_min_values[1, :, 0].max(), max_min_values[1, :, 1].min()
 
-        human1 = normalize_and_scale(x_ref_attn_map[0], (human1_min_value, human1_max_value), (self.rope_h1[0], self.rope_h1[1]))
-        human2 = normalize_and_scale(x_ref_attn_map[1], (human2_min_value, human2_max_value), (self.rope_h2[0], self.rope_h2[1]))
-        back   = torch.full((x_ref_attn_map.size(1),), self.rope_bak, dtype=human1.dtype).to(human1.device)
+        human1 = normalize_and_scale(x_ref_attn_map[0], (human1_min_value, human1_max_value),
+                                     (self.rope_h1[0], self.rope_h1[1]))
+        human2 = normalize_and_scale(x_ref_attn_map[1], (human2_min_value, human2_max_value),
+                                     (self.rope_h2[0], self.rope_h2[1]))
+        back = torch.full((x_ref_attn_map.size(1),), self.rope_bak, dtype=human1.dtype).to(human1.device)
         max_indices = x_ref_attn_map.argmax(dim=0)
         normalized_map = torch.stack([human1, human2, back], dim=1)
-        normalized_pos = normalized_map[range(x_ref_attn_map.size(1)), max_indices] # N 
+        normalized_pos = normalized_map[range(x_ref_attn_map.size(1)), max_indices]  # N
 
         q = rearrange(q, "(B N_t) H S C -> B H (N_t S) C", N_t=N_t)
         q = self.rope_1d(q, normalized_pos)
         q = rearrange(q, "B H (N_t S) C -> (B N_t) H S C", N_t=N_t)
 
-        _, N_a, _ = encoder_hidden_states.shape 
-        encoder_kv = self.kv_linear(encoder_hidden_states) 
+        _, N_a, _ = encoder_hidden_states.shape
+        encoder_kv = self.kv_linear(encoder_hidden_states)
         encoder_kv_shape = (B, N_a, 2, self.num_heads, self.head_dim)
-        encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4)) 
-        encoder_k, encoder_v = encoder_kv.unbind(0) 
+        encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4))
+        encoder_k, encoder_v = encoder_kv.unbind(0)
 
         if self.qk_norm:
             encoder_k = self.add_k_norm(encoder_k)
 
-        
         per_frame = torch.zeros(N_a, dtype=encoder_k.dtype).to(encoder_k.device)
-        per_frame[:per_frame.size(0)//2] = (self.rope_h1[0] + self.rope_h1[1]) / 2
-        per_frame[per_frame.size(0)//2:] = (self.rope_h2[0] + self.rope_h2[1]) / 2
-        encoder_pos = torch.concat([per_frame]*N_t, dim=0)
+        per_frame[:per_frame.size(0) // 2] = (self.rope_h1[0] + self.rope_h1[1]) / 2
+        per_frame[per_frame.size(0) // 2:] = (self.rope_h2[0] + self.rope_h2[1]) / 2
+        encoder_pos = torch.concat([per_frame] * N_t, dim=0)
         encoder_k = rearrange(encoder_k, "(B N_t) H S C -> B H (N_t S) C", N_t=N_t)
         encoder_k = self.rope_1d(encoder_k, encoder_pos)
         encoder_k = rearrange(encoder_k, "B H (N_t S) C -> (B N_t) H S C", N_t=N_t)
 
- 
-        q = rearrange(q, "B H M K -> B M H K")
-        encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
-        encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
-        x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=None, op=None,)
-        x = rearrange(x, "B M H K -> B H M K")
+        if npu_available:
+            x = torch_npu.npu_fusion_attention(
+                q, encoder_k, encoder_v, self.num_heads, input_layout="BNSD",
+                pse=None,
+                atten_mask=None,
+                scale=self.head_dim ** -0.5,
+                keep_prob=1.,
+                sync=False,
+                inner_precise=0,
+            )[0]
+        else:
+            q = rearrange(q, "B H M K -> B M H K")
+            encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
+            encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
+            x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=None, op=None, )
+            x = rearrange(x, "B M H K -> B H M K")
 
         # linear transform
         x_output_shape = (B, N, C)
-        x = x.transpose(1, 2) 
-        x = x.reshape(x_output_shape) 
-        x = self.proj(x) 
+        x = x.transpose(1, 2)
+        x = x.reshape(x_output_shape)
+        x = self.proj(x)
         x = self.proj_drop(x)
 
         # reshape x to origin shape
-        x = rearrange(x, "(B N_t) S C -> B (N_t S) C", N_t=N_t) 
+        x = rearrange(x, "(B N_t) S C -> B (N_t S) C", N_t=N_t)
 
         return x
