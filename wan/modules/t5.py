@@ -290,6 +290,8 @@ class T5Encoder(nn.Module):
         self.num_buckets = num_buckets
         self.shared_pos = shared_pos
 
+
+        # print("before encoder only token_embedding")
         # layers
         self.token_embedding = vocab if isinstance(vocab, nn.Embedding) \
             else nn.Embedding(vocab, dim)
@@ -302,6 +304,7 @@ class T5Encoder(nn.Module):
         ])
         self.norm = T5LayerNorm(dim)
 
+        # print("before encoder only init")
         # initialize weights
         self.apply(init_weights)
 
@@ -397,6 +400,7 @@ class T5Model(nn.Module):
         self.decoder_layers = decoder_layers
         self.num_buckets = num_buckets
 
+        
         # layers
         self.token_embedding = nn.Embedding(vocab_size, dim)
         self.encoder = T5Encoder(self.token_embedding, dim, dim_attn, dim_ffn,
@@ -514,7 +518,9 @@ class T5EncoderModel:
                 return_tokenizer=False,
                 dtype=dtype,
                 device=device).eval().requires_grad_(False)
+            # model.load_state_dict(load_file(checkpoint_path, device='cpu'))
             model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
+            logging.info(f'loaded {checkpoint_path}')
         self.model = model
         self.model.eval().requires_grad_(False)
         if shard_fn is not None:

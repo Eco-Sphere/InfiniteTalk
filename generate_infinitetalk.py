@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import json
+import time
 import warnings
 from datetime import datetime
 
@@ -12,6 +13,8 @@ warnings.filterwarnings('ignore')
 import random
 
 import torch
+import torch_npu
+from torch_npu.contrib import transfer_to_npu
 import torch.distributed as dist
 from PIL import Image
 import subprocess
@@ -32,6 +35,45 @@ import numpy as np
 from einops import rearrange
 import soundfile as sf
 import re
+
+from functools import wraps
+
+print("[Monkey-Patch] Applying Advanced NPU Autocast Patch...")
+
+# 保存原始类
+_original_autocast = torch.autocast
+
+# 1. 针对 torch.autocast 的补丁 (需要 device_type 参数)
+class NPUPatchedAutocast(_original_autocast):
+    def __init__(self, device_type, dtype=None, *args, **kwargs):
+        if device_type == 'cuda':
+            device_type = 'npu'
+        super().__init__(device_type, dtype, *args, **kwargs)
+
+    def __enter__(self):
+        ctx = super().__enter__()
+        # 强制开启 NPU float32 autocast 逻辑
+        if self.device_type == 'npu' and self.dtype == torch.float32:
+            torch_npu.npu.set_autocast_enabled(True)
+        return ctx
+
+# 2. 针对 torch.cuda.amp.autocast 的补丁 (不需要 device_type 参数)
+class NPULegacyAutocast(_original_autocast):
+    def __init__(self, enabled=True, dtype=None, cache_enabled=True):
+        # 硬编码 device_type='npu'，完美适配 @amp.autocast(enabled=False)
+        super().__init__(device_type='npu', dtype=dtype, enabled=enabled, cache_enabled=cache_enabled)
+
+    def __enter__(self):
+        return super().__enter__()
+
+# 3. 应用补丁
+torch.autocast = NPUPatchedAutocast
+
+# 关键修正：针对 cuda.amp 路径使用 Legacy 补丁
+if hasattr(torch.cuda.amp, 'autocast'):
+    torch.cuda.amp.autocast = NPULegacyAutocast
+
+print("[Monkey-Patch] Done. Legacy & New Autocast both redirected to NPU.")
 
 
 def _validate_args(args):
@@ -266,6 +308,29 @@ def _parse_args():
         type=str,
         default=None,
         help="Quantization type, must be 'int8' or 'fp8'."
+    )
+    parser.add_argument(
+        "--use_rainfusion", 
+        action='store_true', 
+        help="Whether to use sparse fa"
+    )
+    parser.add_argument(
+        "--sparsity", 
+        type=float, 
+        default=0.64, 
+        help="Sparsity of flash attention, greater means more speed"
+    )
+    parser.add_argument(
+        "--sparse_start_step", 
+        type=int, 
+        default=15
+    )
+    parser.add_argument(
+        "--rainfusion_type",
+        type=str,
+        default="v1",
+        choices=["v1", "v2"],
+        help="The type of rainfusion type."
     )
     
     args = parser.parse_args()
@@ -538,6 +603,20 @@ def generate(args):
         dit_path=args.dit_path,
         infinitetalk_dir=args.infinitetalk_dir
     )
+
+    if args.use_rainfusion:
+        rainfusion_config = {
+            "sparsity": args.sparsity,
+            "skip_timesteps": args.sparse_start_step,
+            "grid_size": None,
+            "atten_mask_all": None,
+            "type": args.rainfusion_type
+        }
+        if args.dit_fsdp:
+            wan_i2v.model._fsdp_wrapped_module.rainfusion_config = rainfusion_config
+        else:
+            wan_i2v.model.rainfusion_config = rainfusion_config
+
     if args.num_persistent_param_in_dit is not None:
         wan_i2v.vram_management = True
         wan_i2v.enable_vram_management(
@@ -547,11 +626,11 @@ def generate(args):
     generated_list = []
     with open(args.input_json, 'r', encoding='utf-8') as f:
         input_data = json.load(f)
-        
+
     wav2vec_feature_extractor, audio_encoder= custom_init('cpu', args.wav2vec_dir)
     args.audio_save_dir = os.path.join(args.audio_save_dir, input_data['cond_video'].split('/')[-1].split('.')[0])
     os.makedirs(args.audio_save_dir,exist_ok=True)
-    
+
     conds_list = []
 
     if args.scene_seg and is_video(input_data['cond_video']):
@@ -574,6 +653,9 @@ def generate(args):
         if len(input_data['cond_audio'])==2:
             conds_list.append([input_data['cond_audio']['person2']])
 
+    begin = time.time()
+    begin_total_time = time.time()
+
     if len(input_data['cond_audio'])==2:
         new_human_speech1, new_human_speech2, sum_human_speechs = audio_prepare_multi(input_data['cond_audio']['person1'], input_data['cond_audio']['person2'], input_data['audio_type'])
         sum_audio = os.path.join(args.audio_save_dir, 'sum_all.wav')
@@ -584,64 +666,111 @@ def generate(args):
         sum_audio = os.path.join(args.audio_save_dir, 'sum_all.wav')
         sf.write(sum_audio, human_speech, 16000)
         input_data['video_audio'] = sum_audio
-    logging.info("Generating video ...")
-        
-    for idx, items in enumerate(zip(*conds_list)):
-        print(items)
-        input_clip = {}
-        input_clip['prompt'] = input_data['prompt']
-        input_clip['cond_video'] = items[0]
 
-        if 'audio_type' in input_data:
-            input_clip['audio_type'] = input_data['audio_type']
-        if 'bbox' in input_data:
-            input_clip['bbox'] = input_data['bbox']
-        cond_audio = {}
-        if args.audio_mode=='localfile':
-            if len(input_data['cond_audio'])==2:
-                new_human_speech1, new_human_speech2, sum_human_speechs = audio_prepare_multi(items[1], items[2], input_data['audio_type'])
-                audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder)
-                audio_embedding_2 = get_embedding(new_human_speech2, wav2vec_feature_extractor, audio_encoder)
-                emb1_path = os.path.join(args.audio_save_dir, '1.pt')
-                emb2_path = os.path.join(args.audio_save_dir, '2.pt')
-                sum_audio = os.path.join(args.audio_save_dir, 'sum.wav')
-                sf.write(sum_audio, sum_human_speechs, 16000)
-                torch.save(audio_embedding_1, emb1_path)
-                torch.save(audio_embedding_2, emb2_path)
-                cond_audio['person1'] = emb1_path
-                cond_audio['person2'] = emb2_path
-                input_clip['video_audio'] = sum_audio
-                v_length = audio_embedding_1.shape[0]
-            elif len(input_data['cond_audio'])==1:
-                human_speech = audio_prepare_single(items[1])
-                audio_embedding = get_embedding(human_speech, wav2vec_feature_extractor, audio_encoder)
-                emb_path = os.path.join(args.audio_save_dir, '1.pt')
-                sum_audio = os.path.join(args.audio_save_dir, 'sum.wav')
-                sf.write(sum_audio, human_speech, 16000)
-                torch.save(audio_embedding, emb_path)
-                cond_audio['person1'] = emb_path
-                input_clip['video_audio'] = sum_audio
-                v_length = audio_embedding.shape[0]
-        
-        input_clip['cond_audio'] = cond_audio
-                    
-        video = wan_i2v.generate_infinitetalk(
-            input_clip,
-            size_buckget=args.size,
-            motion_frame=args.motion_frame,
-            frame_num=args.frame_num,
-            shift=args.sample_shift,
-            sampling_steps=args.sample_steps,
-            text_guide_scale=args.sample_text_guide_scale,
-            audio_guide_scale=args.sample_audio_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model,
-            max_frames_num=args.frame_num if args.mode == 'clip' else args.max_frame_num,
-            color_correction_strength = args.color_correction_strength,
-            extra_args=args,
-            )
-        
-        generated_list.append(video)
+    logging.info(f"[time records] audio prepare used time: {time.time() - begin:.2f}s")
+
+    logging.info("Generating video ...")
+    warmup_time = 0
+
+    for idx, items in enumerate(zip(*conds_list)):
+       print(items)
+       begin = time.time()
+
+       input_clip = {}
+       input_clip['prompt'] = input_data['prompt']
+       input_clip['cond_video'] = items[0]
+
+       if 'audio_type' in input_data:
+           input_clip['audio_type'] = input_data['audio_type']
+       if 'bbox' in input_data:
+           input_clip['bbox'] = input_data['bbox']
+       cond_audio = {}
+       if args.audio_mode=='localfile':
+           if len(input_data['cond_audio'])==2:
+               new_human_speech1, new_human_speech2, sum_human_speechs = audio_prepare_multi(items[1], items[2], input_data['audio_type'])
+               audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder)
+               audio_embedding_2 = get_embedding(new_human_speech2, wav2vec_feature_extractor, audio_encoder)
+               emb1_path = os.path.join(args.audio_save_dir, '1.pt')
+               emb2_path = os.path.join(args.audio_save_dir, '2.pt')
+               sum_audio = os.path.join(args.audio_save_dir, 'sum.wav')
+               sf.write(sum_audio, sum_human_speechs, 16000)
+               torch.save(audio_embedding_1, emb1_path)
+               torch.save(audio_embedding_2, emb2_path)
+               cond_audio['person1'] = emb1_path
+               cond_audio['person2'] = emb2_path
+               input_clip['video_audio'] = sum_audio
+               v_length = audio_embedding_1.shape[0]
+           elif len(input_data['cond_audio'])==1:
+               human_speech = audio_prepare_single(items[1])
+               audio_embedding = get_embedding(human_speech, wav2vec_feature_extractor, audio_encoder)
+               emb_path = os.path.join(args.audio_save_dir, f'{rank}_1.pt')
+               sum_audio = os.path.join(args.audio_save_dir, f'{rank}_sum.wav')
+               sf.write(sum_audio, human_speech, 16000)
+               torch.save(audio_embedding, emb_path)
+               cond_audio['person1'] = emb_path
+               input_clip['video_audio'] = sum_audio
+               v_length = audio_embedding.shape[0]
+
+       input_clip['cond_audio'] = cond_audio
+       
+       logging.info(f"[time records] embedding used time: {time.time() - begin:.2f}s")
+       begin = time.time()
+       logging.info(f"warm up 2 step")
+       video = wan_i2v.generate_infinitetalk(
+           input_clip,
+           size_buckget=args.size,
+           motion_frame=args.motion_frame,
+           frame_num=args.frame_num,
+           shift=args.sample_shift,
+           sampling_steps=args.sample_steps,
+           text_guide_scale=args.sample_text_guide_scale,
+           audio_guide_scale=args.sample_audio_guide_scale,
+           seed=args.base_seed,
+           offload_model=args.offload_model,
+           max_frames_num=args.frame_num if args.mode == 'clip' else args.max_frame_num,
+           color_correction_strength = args.color_correction_strength,
+           extra_args=args,
+           )
+
+       warmup_time = time.time() - begin
+       logging.info(f"[time records] warm up end, used time: {warmup_time:.2f}s")
+       begin = time.time()
+
+       ## 采集profiling
+       #experimental_config = torch_npu.profiler._ExperimentalConfig(
+       #    export_type=torch_npu.profiler.ExportType.Text,
+       #    profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+       #    data_simplification=False
+       #)
+       #with torch_npu.profiler.profile(
+       #    activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
+       #    with_stack=False,
+       #    record_shapes=True,
+       #    profile_memory=False,
+       #    schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1, skip_first=0),
+       #    experimental_config=experimental_config,
+       #    on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("./profiling_dir_0311_npu4_rain_step1_085_block39_l1_nostack_oprator")
+       #) as prof:
+       video = wan_i2v.generate_infinitetalk(
+           input_clip,
+           size_buckget=args.size,
+           motion_frame=args.motion_frame,
+           frame_num=args.frame_num,
+           shift=args.sample_shift,
+           sampling_steps=args.sample_steps,
+           text_guide_scale=args.sample_text_guide_scale,
+           audio_guide_scale=args.sample_audio_guide_scale,
+           seed=args.base_seed,
+           offload_model=args.offload_model,
+           max_frames_num=args.frame_num if args.mode == 'clip' else args.max_frame_num,
+           color_correction_strength = args.color_correction_strength,
+           extra_args=args,
+           )      
+       #prof.step()
+       generated_list.append(video)
+       logging.info(f"[time records] generate vidio used time:{time.time() - begin:.2f}s")
+
+    begin = time.time()
 
     if rank == 0:
         
@@ -654,7 +783,10 @@ def generate(args):
         sum_video = torch.cat(generated_list, dim=1)
         save_video_ffmpeg(sum_video, args.save_file, [input_data['video_audio']], high_quality_save=False)
    
+    logging.info(f"[time records] save vidio used time: {time.time() - begin:.2f}s")
     logging.info(f"Saving generated video to {args.save_file}.mp4")  
+    
+    logging.info(f"[time records] generate vidio total used time: {time.time() - begin_total_time - warmup_time:.2f}s")
     logging.info("Finished.")
 
 

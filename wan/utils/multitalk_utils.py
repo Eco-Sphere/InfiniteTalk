@@ -22,6 +22,8 @@ import binascii
 import os.path as osp
 from skimage import color
 
+import kornia.color as kc
+
 VID_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv")
 ASPECT_RATIO_627 = {
      '0.26': ([320, 1216], 1), '0.38': ([384, 1024], 1), '0.50': ([448, 896], 1), '0.67': ([512, 768], 1), 
@@ -46,23 +48,79 @@ def torch_gc():
 
 
 
-def split_token_counts_and_frame_ids(T, token_frame, world_size, rank):
+# def split_token_counts_and_frame_ids(T, token_frame, world_size, rank):
+#
+#     S = T * token_frame
+#     split_sizes = [S // world_size + (1 if i < S % world_size else 0) for i in range(world_size)]
+#     start = sum(split_sizes[:rank])
+#     end = start + split_sizes[rank]
+#     counts = [0] * T
+#     for idx in range(start, end):
+#         t = idx // token_frame
+#         counts[t] += 1
+#
+#     counts_filtered = []
+#     frame_ids = []
+#     for t, c in enumerate(counts):
+#         if c > 0:
+#             counts_filtered.append(c)
+#             frame_ids.append(t)
+#     return counts_filtered, frame_ids
 
+def split_token_counts_and_frame_ids(T, token_frame, world_size, rank):
+    # 1. 计算总长度和当前 rank 的范围
     S = T * token_frame
-    split_sizes = [S // world_size + (1 if i < S % world_size else 0) for i in range(world_size)]
-    start = sum(split_sizes[:rank])
-    end = start + split_sizes[rank]
-    counts = [0] * T
-    for idx in range(start, end):
-        t = idx // token_frame
-        counts[t] += 1
+    base_size = S // world_size
+    remainder = S % world_size
+
+    # 快速计算 start 和 end，避免列表推导式
+    if rank < remainder:
+        start = rank * (base_size + 1)
+        cur_size = base_size + 1
+    else:
+        start = rank * base_size + remainder
+        cur_size = base_size
+    end = start + cur_size
+
+    if cur_size == 0:
+        return [], []
+
+    # 2. 数学推导核心逻辑 (替代耗时的 for loop)
+    start_t = start // token_frame
+    end_t = (end - 1) // token_frame  # 减1是因为 end 是开区间
 
     counts_filtered = []
     frame_ids = []
-    for t, c in enumerate(counts):
-        if c > 0:
-            counts_filtered.append(c)
-            frame_ids.append(t)
+
+    # 情况 A: 所有数据都在同一帧内
+    if start_t == end_t:
+        frame_ids.append(start_t)
+        counts_filtered.append(end - start)
+        return counts_filtered, frame_ids
+
+    # 情况 B: 跨越多帧
+    # 2.1 处理首帧
+    first_frame_count = (start_t + 1) * token_frame - start
+    if first_frame_count > 0:
+        frame_ids.append(start_t)
+        counts_filtered.append(first_frame_count)
+
+    # 2.2 处理中间的全量帧
+    # 中间帧的数量
+    num_full_frames = end_t - start_t - 1
+    if num_full_frames > 0:
+        # 这里的帧 ID 是连续的
+        middle_frames = list(range(start_t + 1, end_t))
+        frame_ids.extend(middle_frames)
+        counts_filtered.extend([token_frame] * num_full_frames)
+
+    # 2.3 处理尾帧
+    # 尾帧结束位置相对于尾帧起始的偏移量
+    last_frame_count = end - (end_t * token_frame)
+    if last_frame_count > 0:
+        frame_ids.append(end_t)
+        counts_filtered.append(last_frame_count)
+
     return counts_filtered, frame_ids
 
 
@@ -76,9 +134,73 @@ def normalize_and_scale(column, source_range, target_range, epsilon=1e-8):
     return scaled
 
 
-@torch.compile
+# @torch.compile
+# def calculate_x_ref_attn_map(visual_q, ref_k, ref_target_masks, mode='mean', attn_bias=None):
+#
+#     ref_k = ref_k.to(visual_q.dtype).to(visual_q.device)
+#     scale = 1.0 / visual_q.shape[-1] ** 0.5
+#     visual_q = visual_q * scale
+#     visual_q = visual_q.transpose(1, 2)
+#     ref_k = ref_k.transpose(1, 2)
+#     attn = visual_q @ ref_k.transpose(-2, -1)
+#
+#     if attn_bias is not None:
+#         attn = attn + attn_bias
+#
+#     x_ref_attn_map_source = attn.softmax(-1) # B, H, x_seqlens, ref_seqlens
+#
+#
+#     x_ref_attn_maps = []
+#     ref_target_masks = ref_target_masks.to(visual_q.dtype)
+#     x_ref_attn_map_source = x_ref_attn_map_source.to(visual_q.dtype)
+#
+#     for class_idx, ref_target_mask in enumerate(ref_target_masks):
+#         torch_gc()
+#         ref_target_mask = ref_target_mask[None, None, None, ...]
+#         x_ref_attnmap = x_ref_attn_map_source * ref_target_mask
+#         x_ref_attnmap = x_ref_attnmap.sum(-1) / ref_target_mask.sum() # B, H, x_seqlens, ref_seqlens --> B, H, x_seqlens
+#         x_ref_attnmap = x_ref_attnmap.permute(0, 2, 1) # B, x_seqlens, H
+#
+#         if mode == 'mean':
+#             x_ref_attnmap = x_ref_attnmap.mean(-1) # B, x_seqlens
+#         elif mode == 'max':
+#             x_ref_attnmap = x_ref_attnmap.max(-1) # B, x_seqlens
+#
+#         x_ref_attn_maps.append(x_ref_attnmap)
+#
+#     del attn
+#     del x_ref_attn_map_source
+#     torch_gc()
+#
+#     return torch.concat(x_ref_attn_maps, dim=0)
+#
+#
+# def get_attn_map_with_target(visual_q, ref_k, shape, ref_target_masks=None, split_num=2, enable_sp=False):
+#     """Args:
+#         query (torch.tensor): B M H K
+#         key (torch.tensor): B M H K
+#         shape (tuple): (N_t, N_h, N_w)
+#         ref_target_masks: [B, N_h * N_w]
+#     """
+#
+#     N_t, N_h, N_w = shape
+#     if enable_sp:
+#         ref_k = get_sp_group().all_gather(ref_k, dim=1)
+#
+#     x_seqlens = N_h * N_w
+#     ref_k     = ref_k[:, :x_seqlens]
+#     _, seq_lens, heads, _ = visual_q.shape
+#     class_num, _ = ref_target_masks.shape
+#     x_ref_attn_maps = torch.zeros(class_num, seq_lens).to(visual_q.device).to(visual_q.dtype)
+#
+#     split_chunk = heads // split_num
+#
+#     for i in range(split_num):
+#         x_ref_attn_maps_perhead = calculate_x_ref_attn_map(visual_q[:, :, i*split_chunk:(i+1)*split_chunk, :], ref_k[:, :, i*split_chunk:(i+1)*split_chunk, :], ref_target_masks)
+#         x_ref_attn_maps += x_ref_attn_maps_perhead
+#
+#     return x_ref_attn_maps / split_num
 def calculate_x_ref_attn_map(visual_q, ref_k, ref_target_masks, mode='mean', attn_bias=None):
-    
     ref_k = ref_k.to(visual_q.dtype).to(visual_q.device)
     scale = 1.0 / visual_q.shape[-1] ** 0.5
     visual_q = visual_q * scale
@@ -89,35 +211,36 @@ def calculate_x_ref_attn_map(visual_q, ref_k, ref_target_masks, mode='mean', att
     if attn_bias is not None:
         attn = attn + attn_bias
 
-    x_ref_attn_map_source = attn.softmax(-1) # B, H, x_seqlens, ref_seqlens
-
+    x_ref_attn_map_source = attn.softmax(-1)  # B, H, x_seqlens, ref_seqlens
 
     x_ref_attn_maps = []
     ref_target_masks = ref_target_masks.to(visual_q.dtype)
     x_ref_attn_map_source = x_ref_attn_map_source.to(visual_q.dtype)
 
     for class_idx, ref_target_mask in enumerate(ref_target_masks):
-        torch_gc()
+        #torch_gc()
         ref_target_mask = ref_target_mask[None, None, None, ...]
         x_ref_attnmap = x_ref_attn_map_source * ref_target_mask
-        x_ref_attnmap = x_ref_attnmap.sum(-1) / ref_target_mask.sum() # B, H, x_seqlens, ref_seqlens --> B, H, x_seqlens
-        x_ref_attnmap = x_ref_attnmap.permute(0, 2, 1) # B, x_seqlens, H
-       
+        x_ref_attnmap = x_ref_attnmap.sum(
+            -1) / ref_target_mask.sum()  # B, H, x_seqlens, ref_seqlens --> B, H, x_seqlens
+        x_ref_attnmap = x_ref_attnmap.permute(0, 2, 1)  # B, x_seqlens, H
+
         if mode == 'mean':
-            x_ref_attnmap = x_ref_attnmap.mean(-1) # B, x_seqlens
+            x_ref_attnmap = x_ref_attnmap.mean(-1)  # B, x_seqlens
         elif mode == 'max':
-            x_ref_attnmap = x_ref_attnmap.max(-1) # B, x_seqlens
-        
+            x_ref_attnmap = x_ref_attnmap.max(-1)  # B, x_seqlens
+
         x_ref_attn_maps.append(x_ref_attnmap)
-    
+
     del attn
     del x_ref_attn_map_source
-    torch_gc()
+    #torch_gc()
 
     return torch.concat(x_ref_attn_maps, dim=0)
 
-
-def get_attn_map_with_target(visual_q, ref_k, shape, ref_target_masks=None, split_num=2, enable_sp=False):
+# 为了优化copy对x_ref_attn_maps前移并持久化保存
+def get_attn_map_with_target(visual_q, ref_k, shape, x_ref_attn_maps, ref_target_masks=None, split_num=2, enable_sp=False):
+#def get_attn_map_with_target(visual_q, ref_k, shape, ref_target_masks=None, split_num=2, enable_sp=False):
     """Args:
         query (torch.tensor): B M H K
         key (torch.tensor): B M H K
@@ -128,19 +251,21 @@ def get_attn_map_with_target(visual_q, ref_k, shape, ref_target_masks=None, spli
     N_t, N_h, N_w = shape
     if enable_sp:
         ref_k = get_sp_group().all_gather(ref_k, dim=1)
-    
+
     x_seqlens = N_h * N_w
-    ref_k     = ref_k[:, :x_seqlens]
+    ref_k = ref_k[:, :x_seqlens]
     _, seq_lens, heads, _ = visual_q.shape
-    class_num, _ = ref_target_masks.shape
-    x_ref_attn_maps = torch.zeros(class_num, seq_lens).to(visual_q.device).to(visual_q.dtype)
+    #class_num, _ = ref_target_masks.shape
+    #x_ref_attn_maps = torch.zeros(class_num, seq_lens).to(visual_q.device).to(visual_q.dtype)
 
     split_chunk = heads // split_num
-    
+
     for i in range(split_num):
-        x_ref_attn_maps_perhead = calculate_x_ref_attn_map(visual_q[:, :, i*split_chunk:(i+1)*split_chunk, :], ref_k[:, :, i*split_chunk:(i+1)*split_chunk, :], ref_target_masks)
+        x_ref_attn_maps_perhead = calculate_x_ref_attn_map(visual_q[:, :, i * split_chunk:(i + 1) * split_chunk, :],
+                                                           ref_k[:, :, i * split_chunk:(i + 1) * split_chunk, :],
+                                                           ref_target_masks)
         x_ref_attn_maps += x_ref_attn_maps_perhead
-    
+
     return x_ref_attn_maps / split_num
 
 
@@ -234,83 +359,101 @@ def cache_video(tensor,
         writer.close()
         return cache_file
 
+
 def save_video_ffmpeg(gen_video_samples, save_path, vocal_audio_list, fps=25, quality=5, high_quality_save=False):
-    
+    # 1. 路径万无一失：强制转换为绝对路径并清理前后空格
+    save_path = os.path.abspath(str(save_path).strip())
+    save_path_tmp = save_path + "-temp.mp4"
+    save_path_crop_audio = save_path + "-cropaudio.wav"
+    save_path_final = save_path + ".mp4"
+
+    # 内部定义的 save_video 保持不变
     def save_video(frames, save_path, fps, quality=9, ffmpeg_params=None):
-        writer = imageio.get_writer(
-            save_path, fps=fps, quality=quality, ffmpeg_params=ffmpeg_params
-        )
+        import imageio
+        from tqdm import tqdm
+        import numpy as np
+        writer = imageio.get_writer(save_path, fps=fps, quality=quality, ffmpeg_params=ffmpeg_params)
         for frame in tqdm(frames, desc="Saving video"):
             frame = np.array(frame)
             writer.append_data(frame)
         writer.close()
-    save_path_tmp = save_path + "-temp.mp4"
 
+    # --- 视频渲染逻辑开始 ---
     if high_quality_save:
+        # 这里调用你原来的 cache_video 函数
         cache_video(
-                    tensor=gen_video_samples.unsqueeze(0),
-                    save_file=save_path_tmp,
-                    fps=fps,
-                    nrow=1,
-                    normalize=True,
-                    value_range=(-1, 1)
-                    )
+            tensor=gen_video_samples.unsqueeze(0),
+            save_file=save_path_tmp,
+            fps=fps,
+            nrow=1,
+            normalize=True,
+            value_range=(-1, 1)
+        )
     else:
-        video_audio = (gen_video_samples+1)/2 # C T H W
+        import numpy as np
+        video_audio = (gen_video_samples + 1) / 2
         video_audio = video_audio.permute(1, 2, 3, 0).cpu().numpy()
-        video_audio = np.clip(video_audio * 255, 0, 255).astype(np.uint8)  # to [0, 255]
+        video_audio = np.clip(video_audio * 255, 0, 255).astype(np.uint8)
         save_video(video_audio, save_path_tmp, fps=fps, quality=quality)
 
-
-    # crop audio according to video length
+    # --- 音频处理开始 ---
     _, T, _, _ = gen_video_samples.shape
     duration = T / fps
-    save_path_crop_audio = save_path + "-cropaudio.wav"
-    final_command = [
-        "ffmpeg",
-        "-i",
-        vocal_audio_list[0],
-        "-t",
-        f'{duration}',
-        save_path_crop_audio,
-    ]
-    subprocess.run(final_command, check=True)
 
-    save_path = save_path + ".mp4"
+    # 裁剪音频指令：增加 -y 确保覆盖
+    cmd_audio = ["ffmpeg", "-y", "-i", str(vocal_audio_list[0]), "-t", str(duration), save_path_crop_audio]
+    subprocess.run(cmd_audio, check=True, capture_output=True)
+
+    # --- 万无一失的编码器检测逻辑 ---
+    # 优先尝试 libx264，如果不可用则退而求其次使用 mpeg4
+    video_encoder = "libx264"
+    try:
+        # 检查系统是否支持 libx264
+        check_enc = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True)
+        if "libx264" not in check_enc.stdout:
+            video_encoder = "mpeg4"
+    except:
+        video_encoder = "mpeg4"
+
+    # --- 最终合成指令 ---
+    # 这里的逻辑完全对应你原本的 if-else，但增加了兼容性参数
+    common_args = [
+        "ffmpeg", "-y",
+        "-i", save_path_tmp,
+        "-i", save_path_crop_audio,
+    ]
+
     if high_quality_save:
-        final_command = [
-            "ffmpeg",
-            "-y",
-            "-i", save_path_tmp,
-            "-i", save_path_crop_audio,
-            "-c:v", "libx264",
-            "-crf", "0",
-            "-preset", "veryslow",
-            "-c:a", "aac", 
-            "-shortest",
-            save_path,
-        ]
-        subprocess.run(final_command, check=True)
-        os.remove(save_path_tmp)
-        os.remove(save_path_crop_audio)
+        # 保持原有的高质量参数，但增加兼容性 pix_fmt
+        codec_args = ["-c:v", video_encoder, "-crf", "18", "-preset", "slow"]
     else:
-        final_command = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            save_path_tmp,
-            "-i",
-            save_path_crop_audio,
-            "-c:v",
-            "libx264",
-            "-c:a",
-            "aac",
-            "-shortest",
-            save_path,
-        ]
-        subprocess.run(final_command, check=True)
-        os.remove(save_path_tmp)
-        os.remove(save_path_crop_audio)
+        # 保持原有普通质量参数
+        codec_args = ["-c:v", video_encoder, "-q:v", "5"] if video_encoder == "mpeg4" else ["-c:v", "libx264"]
+
+    final_command = common_args + codec_args + [
+        "-c:a", "aac",
+        "-pix_fmt", "yuv420p",  # 必须加，否则有些播放器打不开
+        "-shortest",
+        save_path_final
+    ]
+
+    # --- 执行与健壮的报错捕获 ---
+    try:
+        print(f"Final Muxing Command: {' '.join(final_command)}")
+        # 增加 capture_output 以便在失败时查看 stderr
+        result = subprocess.run(final_command, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        print("FFmpeg Error detected!")
+        print(f"Command executed: {' '.join(e.cmd)}")
+        print(f"Standard Error output: {e.stderr}")
+        raise e
+    finally:
+        # 清理临时文件逻辑，增加存在性判断
+        for f in [save_path_tmp, save_path_crop_audio]:
+            if os.path.exists(f):
+                os.remove(f)
+
+    print(f"Successfully saved to: {save_path_final}")
 
 
 class MomentumBuffer:
@@ -358,106 +501,197 @@ def adaptive_projected_guidance(
 
 
 
-def match_and_blend_colors(source_chunk: torch.Tensor, reference_image: torch.Tensor, strength: float) -> torch.Tensor:
+# def match_and_blend_colors(source_chunk: torch.Tensor, reference_image: torch.Tensor, strength: float) -> torch.Tensor:
+#     """
+#     Matches the color of a source video chunk to a reference image and blends with the original.
+#
+#     Args:
+#         source_chunk (torch.Tensor): The video chunk to be color-corrected (B, C, T, H, W) in range [-1, 1].
+#                                      Assumes B=1 (batch size of 1).
+#         reference_image (torch.Tensor): The reference image (B, C, 1, H, W) in range [-1, 1].
+#                                         Assumes B=1 and T=1 (single reference frame).
+#         strength (float): The strength of the color correction (0.0 to 1.0).
+#                           0.0 means no correction, 1.0 means full correction.
+#
+#     Returns:
+#         torch.Tensor: The color-corrected and blended video chunk.
+#     """
+#     # print(f"[match_and_blend_colors] Input source_chunk shape: {source_chunk.shape}, reference_image shape: {reference_image.shape}, strength: {strength}")
+#
+#     if strength == 0.0:
+#         # print(f"[match_and_blend_colors] Strength is 0, returning original source_chunk.")
+#         return source_chunk
+#
+#     if not 0.0 <= strength <= 1.0:
+#         raise ValueError(f"Strength must be between 0.0 and 1.0, got {strength}")
+#
+#     device = source_chunk.device
+#     dtype = source_chunk.dtype
+#
+#     # Squeeze batch dimension, permute to T, H, W, C for skimage
+#     # Source: (1, C, T, H, W) -> (T, H, W, C)
+#     source_np = source_chunk.squeeze(0).permute(1, 2, 3, 0).cpu().numpy()
+#     # Reference: (1, C, 1, H, W) -> (H, W, C)
+#     ref_np = reference_image.squeeze(0).squeeze(1).permute(1, 2, 0).cpu().numpy() # Squeeze T dimension as well
+#
+#     # Normalize from [-1, 1] to [0, 1] for skimage
+#     source_np_01 = (source_np + 1.0) / 2.0
+#     ref_np_01 = (ref_np + 1.0) / 2.0
+#
+#     # Clip to ensure values are strictly in [0, 1] after potential float precision issues
+#     source_np_01 = np.clip(source_np_01, 0.0, 1.0)
+#     ref_np_01 = np.clip(ref_np_01, 0.0, 1.0)
+#
+#     # Convert reference to Lab
+#     try:
+#         ref_lab = color.rgb2lab(ref_np_01)
+#     except ValueError as e:
+#         # Handle potential errors if image data is not valid for conversion
+#         print(f"Warning: Could not convert reference image to Lab: {e}. Skipping color correction for this chunk.")
+#         return source_chunk
+#
+#
+#     corrected_frames_np_01 = []
+#     for i in range(source_np_01.shape[0]): # Iterate over time (T)
+#         source_frame_rgb_01 = source_np_01[i]
+#
+#         try:
+#             source_lab = color.rgb2lab(source_frame_rgb_01)
+#         except ValueError as e:
+#             print(f"Warning: Could not convert source frame {i} to Lab: {e}. Using original frame.")
+#             corrected_frames_np_01.append(source_frame_rgb_01)
+#             continue
+#
+#         corrected_lab_frame = source_lab.copy()
+#
+#         # Perform color transfer for L, a, b channels
+#         for j in range(3): # L, a, b
+#             mean_src, std_src = source_lab[:, :, j].mean(), source_lab[:, :, j].std()
+#             mean_ref, std_ref = ref_lab[:, :, j].mean(), ref_lab[:, :, j].std()
+#
+#             # Avoid division by zero if std_src is 0
+#             if std_src == 0:
+#                 # If source channel has no variation, keep it as is, but shift by reference mean
+#                 # This case is debatable, could also just copy source or target mean.
+#                 # Shifting by target mean helps if source is flat but target isn't.
+#                 corrected_lab_frame[:, :, j] = mean_ref
+#             else:
+#                 corrected_lab_frame[:, :, j] = (corrected_lab_frame[:, :, j] - mean_src) * (std_ref / std_src) + mean_ref
+#
+#         try:
+#             fully_corrected_frame_rgb_01 = color.lab2rgb(corrected_lab_frame)
+#         except ValueError as e:
+#             print(f"Warning: Could not convert corrected frame {i} back to RGB: {e}. Using original frame.")
+#             corrected_frames_np_01.append(source_frame_rgb_01)
+#             continue
+#
+#         # Clip again after lab2rgb as it can go slightly out of [0,1]
+#         fully_corrected_frame_rgb_01 = np.clip(fully_corrected_frame_rgb_01, 0.0, 1.0)
+#
+#         # Blend with original source frame (in [0,1] RGB)
+#         blended_frame_rgb_01 = (1 - strength) * source_frame_rgb_01 + strength * fully_corrected_frame_rgb_01
+#         corrected_frames_np_01.append(blended_frame_rgb_01)
+#
+#     corrected_chunk_np_01 = np.stack(corrected_frames_np_01, axis=0)
+#
+#     # Convert back to [-1, 1]
+#     corrected_chunk_np_minus1_1 = (corrected_chunk_np_01 * 2.0) - 1.0
+#
+#     # Permute back to (C, T, H, W), add batch dim, and convert to original torch.Tensor type and device
+#     # (T, H, W, C) -> (C, T, H, W)
+#     corrected_chunk_tensor = torch.from_numpy(corrected_chunk_np_minus1_1).permute(3, 0, 1, 2).unsqueeze(0)
+#     corrected_chunk_tensor = corrected_chunk_tensor.contiguous() # Ensure contiguous memory layout
+#     output_tensor = corrected_chunk_tensor.to(device=device, dtype=dtype)
+#     # print(f"[match_and_blend_colors] Output tensor shape: {output_tensor.shape}")
+#     return output_tensor
+
+def match_and_blend_colors(
+    source_chunk: torch.Tensor,      # (B, C, T, H, W)  range [-1,1]
+    reference_image: torch.Tensor,   # (B, C, 1, H, W)  range [-1,1]
+    strength: float,
+) -> torch.Tensor:
     """
-    Matches the color of a source video chunk to a reference image and blends with the original.
+    Fully GPU-based color transfer using Lab space (Reinhard method).
 
     Args:
-        source_chunk (torch.Tensor): The video chunk to be color-corrected (B, C, T, H, W) in range [-1, 1].
-                                     Assumes B=1 (batch size of 1).
-        reference_image (torch.Tensor): The reference image (B, C, 1, H, W) in range [-1, 1].
-                                        Assumes B=1 and T=1 (single reference frame).
-        strength (float): The strength of the color correction (0.0 to 1.0).
-                          0.0 means no correction, 1.0 means full correction.
+        source_chunk: (B, C, T, H, W) in [-1, 1]
+        reference_image: (B, C, 1, H, W) in [-1, 1]
+        strength: 0~1
+        eps: avoid division by zero
+        use_first_frame: if True, compute source stats from first frame only
 
     Returns:
-        torch.Tensor: The color-corrected and blended video chunk.
+        Tensor same shape as source_chunk
     """
-    # print(f"[match_and_blend_colors] Input source_chunk shape: {source_chunk.shape}, reference_image shape: {reference_image.shape}, strength: {strength}")
-
-    if strength == 0.0:
-        # print(f"[match_and_blend_colors] Strength is 0, returning original source_chunk.")
+    use_first_frame = True  # True = 第一帧法, False = 整个chunk统计
+    eps = 1e-6
+    if strength <= 0.0:
         return source_chunk
 
     if not 0.0 <= strength <= 1.0:
-        raise ValueError(f"Strength must be between 0.0 and 1.0, got {strength}")
+        raise ValueError(f"Strength must be between 0 and 1, got {strength}")
 
+    B, C, T, H, W = source_chunk.shape
     device = source_chunk.device
     dtype = source_chunk.dtype
 
-    # Squeeze batch dimension, permute to T, H, W, C for skimage
-    # Source: (1, C, T, H, W) -> (T, H, W, C)
-    source_np = source_chunk.squeeze(0).permute(1, 2, 3, 0).cpu().numpy()
-    # Reference: (1, C, 1, H, W) -> (H, W, C)
-    ref_np = reference_image.squeeze(0).squeeze(1).permute(1, 2, 0).cpu().numpy() # Squeeze T dimension as well
+    # ---- normalize to [0,1] ----
+    src = (source_chunk + 1.0) * 0.5
+    ref = (reference_image + 1.0) * 0.5
 
-    # Normalize from [-1, 1] to [0, 1] for skimage
-    source_np_01 = (source_np + 1.0) / 2.0
-    ref_np_01 = (ref_np + 1.0) / 2.0
+    src = src.clamp(0.0, 1.0)
+    ref = ref.clamp(0.0, 1.0)
 
-    # Clip to ensure values are strictly in [0, 1] after potential float precision issues
-    source_np_01 = np.clip(source_np_01, 0.0, 1.0)
-    ref_np_01 = np.clip(ref_np_01, 0.0, 1.0)
+    # ---- reshape to (B*T, C, H, W) ----
+    src_reshape = src.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+    ref_frame = ref[:, :, 0, :, :]  # (B, C, H, W)
 
-    # Convert reference to Lab
-    try:
-        ref_lab = color.rgb2lab(ref_np_01)
-    except ValueError as e:
-        # Handle potential errors if image data is not valid for conversion
-        print(f"Warning: Could not convert reference image to Lab: {e}. Skipping color correction for this chunk.")
-        return source_chunk
+    # ---- RGB -> Lab (GPU) ----
+    src_lab = kc.rgb_to_lab(src_reshape)
+    ref_lab = kc.rgb_to_lab(ref_frame)
 
+    # ---- compute reference stats (per batch, per channel) ----
+    ref_mean = ref_lab.mean(dim=(2, 3), keepdim=True)  # (B, C, 1, 1)
+    ref_std = ref_lab.std(dim=(2, 3), keepdim=True)    # (B, C, 1, 1)
 
-    corrected_frames_np_01 = []
-    for i in range(source_np_01.shape[0]): # Iterate over time (T)
-        source_frame_rgb_01 = source_np_01[i]
-        
-        try:
-            source_lab = color.rgb2lab(source_frame_rgb_01)
-        except ValueError as e:
-            print(f"Warning: Could not convert source frame {i} to Lab: {e}. Using original frame.")
-            corrected_frames_np_01.append(source_frame_rgb_01)
-            continue
+    # expand reference stats to match B*T
+    ref_mean = ref_mean.repeat_interleave(T, dim=0)
+    ref_std = ref_std.repeat_interleave(T, dim=0)
 
-        corrected_lab_frame = source_lab.copy()
+    # ---- compute source stats ----
+    if use_first_frame:
+        # only first frame statistics
+        src_first = src_lab.view(B, T, C, H, W)[:, 0]  # (B, C, H, W)
+        src_mean = src_first.mean(dim=(2, 3), keepdim=True)
+        src_std = src_first.std(dim=(2, 3), keepdim=True)
 
-        # Perform color transfer for L, a, b channels
-        for j in range(3): # L, a, b
-            mean_src, std_src = source_lab[:, :, j].mean(), source_lab[:, :, j].std()
-            mean_ref, std_ref = ref_lab[:, :, j].mean(), ref_lab[:, :, j].std()
+        src_mean = src_mean.repeat_interleave(T, dim=0)
+        src_std = src_std.repeat_interleave(T, dim=0)
+    else:
+        # chunk-level statistics (more stable)
+        src_lab_bt = src_lab.view(B, T, C, H, W)
+        src_mean = src_lab_bt.mean(dim=(1, 3, 4), keepdim=True)  # (B,1,C,1,1)
+        src_std = src_lab_bt.std(dim=(1, 3, 4), keepdim=True)
 
-            # Avoid division by zero if std_src is 0
-            if std_src == 0:
-                # If source channel has no variation, keep it as is, but shift by reference mean
-                # This case is debatable, could also just copy source or target mean.
-                # Shifting by target mean helps if source is flat but target isn't.
-                corrected_lab_frame[:, :, j] = mean_ref 
-            else:
-                corrected_lab_frame[:, :, j] = (corrected_lab_frame[:, :, j] - mean_src) * (std_ref / std_src) + mean_ref
-        
-        try:
-            fully_corrected_frame_rgb_01 = color.lab2rgb(corrected_lab_frame)
-        except ValueError as e:
-            print(f"Warning: Could not convert corrected frame {i} back to RGB: {e}. Using original frame.")
-            corrected_frames_np_01.append(source_frame_rgb_01)
-            continue
-            
-        # Clip again after lab2rgb as it can go slightly out of [0,1]
-        fully_corrected_frame_rgb_01 = np.clip(fully_corrected_frame_rgb_01, 0.0, 1.0)
+        src_mean = src_mean.repeat_interleave(T, dim=0)
+        src_std = src_std.repeat_interleave(T, dim=0)
 
-        # Blend with original source frame (in [0,1] RGB)
-        blended_frame_rgb_01 = (1 - strength) * source_frame_rgb_01 + strength * fully_corrected_frame_rgb_01
-        corrected_frames_np_01.append(blended_frame_rgb_01)
+    src_std = src_std.clamp_min(eps)
 
-    corrected_chunk_np_01 = np.stack(corrected_frames_np_01, axis=0)
+    # ---- Reinhard transfer ----
+    corrected_lab = (src_lab - src_mean) * (ref_std / src_std) + ref_mean
 
-    # Convert back to [-1, 1]
-    corrected_chunk_np_minus1_1 = (corrected_chunk_np_01 * 2.0) - 1.0
+    # ---- Lab -> RGB ----
+    corrected_rgb = kc.lab_to_rgb(corrected_lab).clamp(0.0, 1.0)
 
-    # Permute back to (C, T, H, W), add batch dim, and convert to original torch.Tensor type and device
-    # (T, H, W, C) -> (C, T, H, W)
-    corrected_chunk_tensor = torch.from_numpy(corrected_chunk_np_minus1_1).permute(3, 0, 1, 2).unsqueeze(0)
-    corrected_chunk_tensor = corrected_chunk_tensor.contiguous() # Ensure contiguous memory layout
-    output_tensor = corrected_chunk_tensor.to(device=device, dtype=dtype)
-    # print(f"[match_and_blend_colors] Output tensor shape: {output_tensor.shape}")
-    return output_tensor
+    # ---- reshape back to (B,C,T,H,W) ----
+    corrected_rgb = corrected_rgb.view(B, T, C, H, W).permute(0, 2, 1, 3, 4)
+
+    # ---- blend ----
+    if strength < 1.0:
+        corrected_rgb = (1 - strength) * src + strength * corrected_rgb
+
+    # ---- back to [-1,1] ----
+    output = corrected_rgb * 2.0 - 1.0
+
+    return output.to(dtype=dtype, device=device)
