@@ -3,6 +3,7 @@ import math
 import numpy as np
 import os
 import torch
+import torch_npu
 import torch.cuda.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,6 +21,9 @@ try:
     logging.info("Using sageattn")
 except:
     USE_SAGEATTN = False
+
+from wan.utils.rainfusion import Rainfusion
+from wan.utils.rainfusion_blockwise import Rainfusion_blockwise
 
 __all__ = ['WanModel']
 
@@ -45,9 +49,29 @@ def rope_params(max_seq_len, dim, theta=10000):
     freqs = torch.outer(
         torch.arange(max_seq_len),
         1.0 / torch.pow(theta,
-                        torch.arange(0, dim, 2).to(torch.float64).div(dim)))
-    freqs = torch.polar(torch.ones_like(freqs), freqs)
+                        torch.arange(0, dim, 2).to(torch.float32).div(dim)))
+    freqs = torch.polar(torch.ones_like(freqs), freqs).to(torch.complex64)
     return freqs
+# @amp.autocast(enabled=False)
+# def rope_params(max_seq_len, dim, theta=10000):
+#     """
+#     return:
+#         cos: [max_seq_len, dim // 2]
+#         sin: [max_seq_len, dim // 2]
+#     """
+#     assert dim % 2 == 0
+#
+#     inv_freq = 1.0 / torch.pow(
+#         theta,
+#         torch.arange(0, dim, 2, dtype=torch.float32) / dim
+#     )
+#
+#     t = torch.arange(max_seq_len, dtype=torch.float32)
+#     freqs = torch.outer(t, inv_freq)  # [L, dim/2]
+#
+#     return freqs.cos(), freqs.sin()
+
+
 
 
 @amp.autocast(enabled=False)
@@ -89,7 +113,8 @@ class WanRMSNorm(nn.Module):
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        return self._norm(x.float()).type_as(x) * self.weight
+        #return self._norm(x.float()).type_as(x) * self.weight
+        return torch_npu.npu_rms_norm(x, self.weight, epsilon=self.eps)[0]
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
@@ -101,15 +126,23 @@ class WanLayerNorm(nn.LayerNorm):
         super().__init__(dim, elementwise_affine=elementwise_affine, eps=eps)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        origin_dtype = inputs.dtype
-        out = F.layer_norm(
-            inputs.float(), 
-            self.normalized_shape, 
-            None if self.weight is None else self.weight.float(), 
-            None if self.bias is None else self.bias.float() ,
+        #origin_dtype = inputs.dtype
+        #out = F.layer_norm(
+        #    inputs.float(), 
+        #    self.normalized_shape, 
+        #    None if self.weight is None else self.weight.float(), 
+        #    None if self.bias is None else self.bias.float() ,
+        #    self.eps
+        #).to(origin_dtype)
+        #return out
+
+        return F.layer_norm(
+            inputs,
+            self.normalized_shape,
+            None if self.weight is None else self.weight,
+            None if self.bias is None else self.bias,
             self.eps
-        ).to(origin_dtype)
-        return out
+        )
 
 
 class WanSelfAttention(nn.Module):
@@ -119,7 +152,8 @@ class WanSelfAttention(nn.Module):
                  num_heads,
                  window_size=(-1, -1),
                  qk_norm=True,
-                 eps=1e-6):
+                 eps=1e-6,
+                 x_ref_attn_maps_cache={}):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -128,6 +162,7 @@ class WanSelfAttention(nn.Module):
         self.window_size = window_size
         self.qk_norm = qk_norm
         self.eps = eps
+        self.x_ref_attn_maps_cache = x_ref_attn_maps_cache
 
         # layers
         self.q = nn.Linear(dim, dim)
@@ -137,14 +172,19 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs, ref_target_masks=None):
+    def forward(self, x, seq_lens, grid_sizes, freqs, ref_target_masks=None, rainfusion_config=None, t_idx=None, b_idx=None):
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
-
+        print(f"------------[SelfAttention] input x: {x.shape}, n_head: {n}, head_dim: {d}")  # 应输出 (b, s, 5120)
         # query, key, value function
         def qkv_fn(x):
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
-            k = self.norm_k(self.k(x)).view(b, s, n, d)
-            v = self.v(x).view(b, s, n, d)
+            # q = self.norm_q(self.q(x)).view(b, s, n, d)
+            # k = self.norm_k(self.k(x)).view(b, s, n, d)
+            # v = self.v(x).view(b, s, n, d)
+            q = self.norm_q(self.q(x)).contiguous().view(b, s, n, d)
+            k = self.norm_k(self.k(x)).contiguous().view(b, s, n, d)
+            v = self.v(x).contiguous().view(b, s, n, d)
+            
+            print(f"---------------[QKV] q: {q.shape}, k: {k.shape}, v: {v.shape}")  # 应输出 (b, s, 16, 128)（dim=2048时）或 (b, s, 40, 128)（dim=5120时）
             return q, k, v
         q, k, v = qkv_fn(x)
 
@@ -159,12 +199,18 @@ class WanSelfAttention(nn.Module):
                 k=k,
                 v=v,
                 k_lens=seq_lens,
-                window_size=self.window_size
+                window_size=self.window_size,
+                rainfusion_config=rainfusion_config,
+                t_idx=t_idx,
+                b_idx=b_idx,
             ).type_as(x)
 
         # output
-        x = x.flatten(2)
+        # x = x.flatten(2)
+        x = x.contiguous().reshape(b, s, n*d)  # n*d=40×128=5120，和dim一致
+        print(f"-----------[After flatten] x: {x.shape}")  # 应输出 (b, s, 5120)，和输入x最后一维一致
         x = self.o(x)
+        print(f"-----------[After self.o] x: {x.shape}")  # 应输出 (b, s, 5120)
         with torch.no_grad():
             x_ref_attn_map = get_attn_map_with_target(q.type_as(x), k.type_as(x), grid_sizes[0], 
                                                     ref_target_masks=ref_target_masks)
@@ -192,11 +238,16 @@ class WanI2VCrossAttention(WanSelfAttention):
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
         # compute query, key, value
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
-        k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
-        v_img = self.v_img(context_img).view(b, -1, n, d)
+        # q = self.norm_q(self.q(x)).view(b, -1, n, d)
+        # k = self.norm_k(self.k(context)).view(b, -1, n, d)
+        # v = self.v(context).view(b, -1, n, d)
+        # k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
+        # v_img = self.v_img(context_img).view(b, -1, n, d)
+        q = self.norm_q(self.q(x)).contiguous().view(b, -1, n, d)
+        k = self.norm_k(self.k(context)).contiguous().view(b, -1, n, d)
+        v = self.v(context).contiguous().view(b, -1, n, d)
+        k_img = self.norm_k_img(self.k_img(context_img)).contiguous().view(b, -1, n, d)
+        v_img = self.v_img(context_img).contiguous().view(b, -1, n, d)
         if USE_SAGEATTN:
             img_x = sageattn(q, k_img, v_img, tensor_layout='NHD')
             x = sageattn(q, k, v, tensor_layout='NHD')
@@ -206,11 +257,37 @@ class WanI2VCrossAttention(WanSelfAttention):
             x = flash_attention(q, k, v, k_lens=context_lens)
 
         # output
-        x = x.flatten(2)
-        img_x = img_x.flatten(2)
+        # x = x.flatten(2)
+        # img_x = img_x.flatten(2)
+        x = x.contiguous().reshape(b, -1, n*d)
+        img_x = img_x.contiguous().reshape(b, -1, n*d)
+        # print(f"-----------[WanI2VCrossAttention] x: {x.shape}")
+        # print(f"-----------[WanI2VCrossAttention] img_x: {img_x.shape}")
+        
         x = x + img_x
         x = self.o(x)
         return x
+
+def WanAdaLayerNorm(
+    layernorm: torch.nn.LayerNorm, 
+    x: torch.Tensor, 
+    scale: torch.Tensor, 
+    shift: torch.Tensor
+):
+    from mindiesd import layernorm_scale_shift
+    return layernorm_scale_shift(
+        layernorm,
+        x,
+        scale[:, 0, :],
+        shift[:, 0, :],
+        fused=True
+    )   
+
+
+class WanFastGelu(nn.GELU):
+
+    def forward(self, x):
+        return torch_npu.npu_fast_gelu(x)
 
 
 class WanAttentionBlock(nn.Module):
@@ -227,7 +304,8 @@ class WanAttentionBlock(nn.Module):
                  output_dim=768,
                  norm_input_visual=True,
                  class_range=24,
-                 class_interval=4):
+                 class_interval=4,
+                 x_ref_attn_maps_cache={}):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -236,10 +314,11 @@ class WanAttentionBlock(nn.Module):
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
+        self.x_ref_attn_maps_cache = x_ref_attn_maps_cache
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm, eps)
+        self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm, eps, self.x_ref_attn_maps_cache)
         self.norm3 = WanLayerNorm(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
@@ -250,7 +329,7 @@ class WanAttentionBlock(nn.Module):
                                                 eps)
         self.norm2 = WanLayerNorm(dim, eps)
         self.ffn = nn.Sequential(
-            nn.Linear(dim, ffn_dim), nn.GELU(approximate='tanh'),
+            nn.Linear(dim, ffn_dim), WanFastGelu(approximate='tanh'),
             nn.Linear(ffn_dim, dim))
 
         # modulation
@@ -279,24 +358,34 @@ class WanAttentionBlock(nn.Module):
         grid_sizes,
         freqs,
         context,
-        context_lens,
+        context_lens,        
+        rainfusion_config,
+        t_idx,
+        b_idx,
         audio_embedding=None,
         ref_target_masks=None,
         human_num=None,
     ):
-
+    
         dtype = x.dtype
-        assert e.dtype == torch.float32
-        with amp.autocast(dtype=torch.float32):
-            e = (self.modulation.to(e.device) + e).chunk(6, dim=1)
-        assert e[0].dtype == torch.float32
+        # assert e.dtype == torch.float32
+        #with amp.autocast(dtype=torch.float32):
+        e = (self.modulation.to(e.device).unsqueeze(0) + e).chunk(6, dim=2)
+        # assert e[0].dtype == torch.float32
 
         # self-attention
         y, x_ref_attn_map = self.self_attn(
-            (self.norm1(x).float() * (1 + e[1]) + e[0]).type_as(x), seq_lens, grid_sizes,
-            freqs, ref_target_masks=ref_target_masks)
-        with amp.autocast(dtype=torch.float32):
-            x = x + y * e[2]
+            WanAdaLayerNorm(self.norm1, x, e[1].squeeze(2), e[0].squeeze(2)),
+            seq_lens, 
+            grid_sizes,
+            freqs, 
+            ref_target_masks=ref_target_masks, 
+            rainfusion_config=rainfusion_config,
+            t_idx=t_idx,
+            b_idx=b_idx
+        )
+        #with amp.autocast(dtype=torch.float32):
+        x = x + y * e[2].squeeze(2)
         
         x = x.to(dtype)
 
@@ -308,9 +397,12 @@ class WanAttentionBlock(nn.Module):
                                         shape=grid_sizes[0], x_ref_attn_map=x_ref_attn_map, human_num=human_num)
         x = x + x_a
 
-        y = self.ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).to(dtype))
-        with amp.autocast(dtype=torch.float32):
-            x = x + y * e[5]
+        y = self.ffn(
+            WanAdaLayerNorm(self.norm2, x, e[4].squeeze(2), e[3].squeeze(2))
+        )
+        
+        #with amp.autocast(dtype=torch.float32):
+        x = x + y * e[5].squeeze(2)
 
 
         x = x.to(dtype)
@@ -341,7 +433,7 @@ class Head(nn.Module):
             x(Tensor): Shape [B, L1, C]
             e(Tensor): Shape [B, C]
         """
-        assert e.dtype == torch.float32
+        # assert e.dtype == torch.float32
         with amp.autocast(dtype=torch.float32):
             e = (self.modulation.to(e.device) + e.unsqueeze(1)).chunk(2, dim=1)
             x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
@@ -485,13 +577,13 @@ class WanModel(ModelMixin, ConfigMixin):
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
-
+        self.x_ref_attn_maps_cache = {}
 
         self.norm_output_audio = norm_output_audio
         self.audio_window = audio_window
         self.intermediate_dim = intermediate_dim
         self.vae_scale = vae_scale
-        
+        self.rainfusion_config = None
 
         # embeddings
         self.patch_embedding = nn.Conv3d(
@@ -540,6 +632,7 @@ class WanModel(ModelMixin, ConfigMixin):
                     norm_output_audio=norm_output_audio,
                 )
 
+        self.freqs_list = None
 
         # initialize weights
         if weight_init:
@@ -605,8 +698,21 @@ class WanModel(ModelMixin, ConfigMixin):
             y=None,
             audio=None,
             ref_target_masks=None,
+            t_idx=0,
         ):
         assert clip_fea is not None and y is not None
+
+        if self.rainfusion_config and self.rainfusion_config["atten_mask_all"] is None:
+            if self.rainfusion_config["type"] == "v1":
+                self.rainfusion_config["grid_size"] = Rainfusion.get_grid_size(x[0].shape, self.patch_size)
+                #logging.info(f"Rainfusion grid size: {self.rainfusion_config['grid_size']}")
+                self.rainfusion_config["atten_mask_all"] = Rainfusion.get_atten_mask(
+                    grid_size=self.rainfusion_config["grid_size"],
+                    sparsity=self.rainfusion_config["sparsity"]
+                )
+            else:
+                #logging.info(f"====== teacache_init v2 Rainfusion grid size: {self.rainfusion_config['grid_size']}")
+                self.rainfusion_config["grid_size"] = Rainfusion_blockwise.get_grid_size(x[0].shape, self.patch_size)
 
         _, T, H, W = x[0].shape
         N_t = T // self.patch_size[0]
@@ -634,7 +740,7 @@ class WanModel(ModelMixin, ConfigMixin):
             e = self.time_embedding(
                 sinusoidal_embedding_1d(self.freq_dim, t).float())
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+            # assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
         # text embedding
         context_lens = None
@@ -731,6 +837,8 @@ class WanModel(ModelMixin, ConfigMixin):
             audio_embedding=audio_embedding,
             ref_target_masks=token_ref_target_masks,
             human_num=human_num,
+            rainfusion_config=self.rainfusion_config,
+            t_idx=t_idx,
             )
         if self.enable_teacache:
             if self.cnt%3==0:
@@ -793,9 +901,9 @@ class WanModel(ModelMixin, ConfigMixin):
         c = self.out_dim
         out = []
         for u, v in zip(x, grid_sizes.tolist()):
-            u = u[:math.prod(v)].view(*v, *self.patch_size, c)
+            u = u[:math.prod(v)].contiguous().view(*v, *self.patch_size, c)
             u = torch.einsum('fhwpqrc->cfphqwr', u)
-            u = u.reshape(c, *[i * j for i, j in zip(v, self.patch_size)])
+            u = u.contiguous().reshape(c, *[i * j for i, j in zip(v, self.patch_size)])
             out.append(u)
         return out
 
