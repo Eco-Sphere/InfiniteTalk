@@ -21,10 +21,12 @@ class CausalConv3d(nn.Conv3d):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._padding = (self.padding[2], self.padding[2], self.padding[1],
-                         self.padding[1], 2 * self.padding[0], 0)
-        self.padding = (0, 0, 0)
-
+        self._padding = (0, 0, 0,
+                         0, 2 * self.padding[0], 0)
+        self.padding = (0, self.padding[1], self.padding[2])
+        # self._padding = (self.padding[2], self.padding[2], self.padding[1],
+        #                  self.padding[1], 2 * self.padding[0], 0)
+        # self.padding = (0, 0, 0)
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
         if cache_x is not None and self._padding[4] > 0:

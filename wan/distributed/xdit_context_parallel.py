@@ -1,4 +1,5 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import logging
 import numpy as np
 import torch
 import torch.nn as nn
@@ -9,66 +10,108 @@ from xfuser.core.distributed import (
     get_sp_group,
 )
 from einops import rearrange
-from xfuser.core.long_ctx_attention import xFuserLongContextAttention
-import xformers.ops
+
+USE_LA = True
+if USE_LA:
+    from ..modules.attn_layer import xFuserLongContextAttention, AttnType
+else:
+    from xfuser.core.long_ctx_attention import xFuserLongContextAttention, AttnType
+# import xformers.ops
+
+from mindiesd import rotary_position_embedding
 
 from ..modules.model import sinusoidal_embedding_1d
 from ..utils.multitalk_utils import get_attn_map_with_target, split_token_counts_and_frame_ids, normalize_and_scale
 from ..modules.attention import SingleStreamAttention, SingleStreamMutiAttention
 
+from wan.utils.rainfusion import Rainfusion
+from wan.utils.rainfusion_blockwise import Rainfusion_blockwise
+
+logger = logging.getLogger(__name__)
 
 def pad_freqs(original_tensor, target_len):
     seq_len, s1, s2 = original_tensor.shape
     pad_size = target_len - seq_len
+    if pad_size == 0:
+        return original_tensor
     padding_tensor = torch.ones(
         pad_size,
         s1,
         s2,
-        dtype=original_tensor.dtype,
-        device=original_tensor.device)
+        dtype=torch.float32,
+        device=original_tensor.device
+        ).to(original_tensor.dtype)
     padded_tensor = torch.cat([original_tensor, padding_tensor], dim=0)
     return padded_tensor
+# def pad_freqs(original_tensor, target_len):
+#     seq_len, s1, s2 = original_tensor.shape
+#     pad_size = target_len - seq_len
+#
+#     # 1. 确定基础实数类型：如果是复数则转为 float32，否则保持原样
+#     base_dtype = torch.float32 if original_tensor.is_complex() else original_tensor.dtype
+#
+#     # 2. 先创建实数的 ones 张量（NPU 支持良好）
+#     padding_tensor = torch.ones(
+#         (pad_size, s1, s2),  # 显式传入 shape 元组
+#         dtype=base_dtype,
+#         device=original_tensor.device
+#     )
+#
+#     # 3. 将实数 ones 转换为原始的复数类型 (1.0 -> 1.0 + 0.0j)
+#     if original_tensor.is_complex():
+#         padding_tensor = padding_tensor.to(original_tensor.dtype)
+#
+#     padded_tensor = torch.cat([original_tensor, padding_tensor], dim=0)
+#     return padded_tensor
 
-
-@amp.autocast(enabled=False)
-def rope_apply(x, grid_sizes, freqs):
+def rope_apply(x, grid_sizes, freqs_list):
     """
     x:          [B, L, N, C].
     grid_sizes: [B, 3].
     freqs:      [M, C // 2].
     """
-    s, n, c = x.size(1), x.size(2), x.size(3) // 2
-    # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1) # [[N, head_dim/2], [N, head_dim/2], [N, head_dim/2]] # T H W 极坐标
-
-    # loop over samples
-    output = []
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-        seq_len = f * h * w
-
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(
-            s, n, -1, 2)) # [L, N, C/2] # 极坐标
-        freqs_i = torch.cat([
-            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-                            dim=-1).reshape(seq_len, 1, -1) # seq_lens, 1,  3 * dim / 2 (T H W)
-
-        # apply rotary embedding
-        sp_size = get_sequence_parallel_world_size()
-        sp_rank = get_sequence_parallel_rank()
-        freqs_i = pad_freqs(freqs_i, s * sp_size)
-        s_per_rank = s
-        freqs_i_rank = freqs_i[(sp_rank * s_per_rank):((sp_rank + 1) *
-                                                       s_per_rank), :, :]
-        x_i = torch.view_as_real(x_i * freqs_i_rank).flatten(2)
-        x_i = torch.cat([x_i, x[i, s:]])
-
-        # append to collection
-        output.append(x_i)
-    return torch.stack(output).float()
+    cos, sin = freqs_list[0]
+    return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", fused=True)
+# @amp.autocast(enabled=False)
+# def rope_apply(x, grid_sizes, freqs):
+#     """
+#     x:          [B, L, N, C].
+#     grid_sizes: [B, 3].
+#     freqs:      [M, C // 2].
+#     """
+#     s, n, c = x.size(1), x.size(2), x.size(3) // 2
+#     # split freqs
+#     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1) # [[N, head_dim/2], [N, head_dim/2], [N, head_dim/2]] # T H W 极坐标
+#
+#     # loop over samples
+#     output = []
+#     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+#         seq_len = f * h * w
+#
+#         # precompute multipliers
+#         x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(
+#             s, n, -1, 2)) # [L, N, C/2] # 极坐标
+#         freqs_i = torch.cat([
+#             freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1).to(torch.complex64),
+#             freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1).to(torch.complex64),
+#             freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1).to(torch.complex64)
+#         ],
+#                             dim=-1).reshape(seq_len, 1, -1) # seq_lens, 1,  3 * dim / 2 (T H W)
+#         if x.dtype == torch.complex128:
+#             x = x.to(torch.complex64)
+#         # apply rotary embedding
+#         sp_size = get_sequence_parallel_world_size()
+#         sp_rank = get_sequence_parallel_rank()
+#         freqs_i = pad_freqs(freqs_i, s * sp_size)
+#         s_per_rank = s
+#         freqs_i_rank = freqs_i[(sp_rank * s_per_rank):((sp_rank + 1) *
+#                                                        s_per_rank), :, :]
+#         x_i = torch.view_as_real(x_i * freqs_i_rank).flatten(2)
+#         x_i = torch.cat([x_i, x[i, s:]])
+#
+#         # append to collection
+#         output.append(x_i)
+#     return torch.stack(output).float()
 
 
 def usp_dit_forward_vace(self, x, vace_context, seq_len, kwargs):
@@ -161,7 +204,7 @@ def usp_dit_forward(
         freqs=self.freqs,
         context=context,
         context_lens=context_lens)
-    
+
     # Context Parallel
     x = torch.chunk(
         x, get_sequence_parallel_world_size(),
@@ -239,13 +282,28 @@ def usp_dit_forward_multitalk(
     y=None,
     audio=None,
     ref_target_masks=None,
+    t_idx=None,
 ):
     """
     x:              A list of videos each with shape [C, T, H, W].
     t:              [B].
     context:        A list of text embeddings each with shape [L, C].
     """
-    
+
+    #print(f"xdit_context_parallel.py:usp_dit_forward_multitalk:t_idx{t_idx}")
+
+    if self.rainfusion_config and self.rainfusion_config["atten_mask_all"] is None:
+        if self.rainfusion_config["type"] == "v1":
+            self.rainfusion_config["grid_size"] = Rainfusion.get_grid_size(x[0].shape, self.patch_size)
+            # logging.info(f"Rainfusion grid size: {self.rainfusion_config['grid_size']}")
+            self.rainfusion_config["atten_mask_all"] = Rainfusion.get_atten_mask(
+                grid_size=self.rainfusion_config["grid_size"],
+                sparsity=self.rainfusion_config["sparsity"]
+            )
+        else:
+            self.rainfusion_config["grid_size"] = Rainfusion_blockwise.get_grid_size(x[0].shape, self.patch_size)
+            #logging.info(f"usp_dit_forward_multitalk v2 Rainfusion grid size: {self.rainfusion_config['grid_size']}")
+
     assert clip_fea is not None and y is not None
     # params
     device = self.patch_embedding.weight.device
@@ -274,11 +332,11 @@ def usp_dit_forward_multitalk(
     ])
 
     # time embeddings
-    with amp.autocast(dtype=torch.float32):
-        e = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim, t).float())
-        e0 = self.time_projection(e).unflatten(1, (6, self.dim))
-        assert e.dtype == torch.float32 and e0.dtype == torch.float32
+    # with amp.autocast(dtype=torch.float32):
+    e = self.time_embedding(
+        sinusoidal_embedding_1d(self.freq_dim, t).float())
+    e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+        # assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
     # context
     context_lens = None
@@ -289,14 +347,14 @@ def usp_dit_forward_multitalk(
         ]))
 
     if clip_fea is not None:
-        context_clip = self.img_emb(clip_fea)  
+        context_clip = self.img_emb(clip_fea)
         context = torch.concat([context_clip, context], dim=1)
 
     # get audio token
     audio_cond = audio.to(device=x.device, dtype=x.dtype)
-    first_frame_audio_emb_s = audio_cond[:, :1, ...] 
-    latter_frame_audio_emb = audio_cond[:, 1:, ...] 
-    latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale) 
+    first_frame_audio_emb_s = audio_cond[:, :1, ...]
+    latter_frame_audio_emb = audio_cond[:, 1:, ...]
+    latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale)
     middle_index = self.audio_window // 2
     latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...] 
     latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
@@ -309,25 +367,24 @@ def usp_dit_forward_multitalk(
     human_num = len(audio_embedding)
     audio_embedding = torch.concat(audio_embedding.split(1), dim=2).to(x.dtype)
 
-
     # convert ref_target_masks to token_ref_target_masks
     if ref_target_masks is not None:
-        ref_target_masks = ref_target_masks.unsqueeze(0).to(torch.float32) 
-        token_ref_target_masks = nn.functional.interpolate(ref_target_masks, size=(N_h, N_w), mode='nearest') 
-        token_ref_target_masks = token_ref_target_masks.squeeze(0) 
+        ref_target_masks = ref_target_masks.unsqueeze(0).to(torch.float32)
+        token_ref_target_masks = nn.functional.interpolate(ref_target_masks, size=(N_h, N_w), mode='nearest')
+        token_ref_target_masks = token_ref_target_masks.squeeze(0)
         token_ref_target_masks = (token_ref_target_masks > 0)
-        token_ref_target_masks = token_ref_target_masks.view(token_ref_target_masks.shape[0], -1) 
+        token_ref_target_masks = token_ref_target_masks.view(token_ref_target_masks.shape[0], -1)
         token_ref_target_masks = token_ref_target_masks.to(x.dtype)
-    
+
     if self.enable_teacache:
         modulated_inp = e0 if self.use_ret_steps else e
-        if self.cnt%3==0: # cond
+        if self.cnt % 3 == 0:  # cond
             if self.cnt < self.ret_steps or self.cnt >= self.cutoff_steps:
                 should_calc_cond = True
                 self.accumulated_rel_l1_distance_cond = 0
             else:
                 rescale_func = np.poly1d(self.coefficients)
-                self.accumulated_rel_l1_distance_cond += rescale_func(((modulated_inp-self.previous_e0_cond).abs().mean() / self.previous_e0_cond.abs().mean()).cpu().item())
+                self.accumulated_rel_l1_distance_cond += rescale_func(((modulated_inp - self.previous_e0_cond).abs().mean() / self.previous_e0_cond.abs().mean()).cpu().item())
                 # print("accumulated_rel_l1_distance_even", self.accumulated_rel_l1_distance_even)
                 if self.accumulated_rel_l1_distance_cond < self.teacache_thresh:
                     should_calc_cond = False
@@ -335,7 +392,7 @@ def usp_dit_forward_multitalk(
                     should_calc_cond = True
                     self.accumulated_rel_l1_distance_cond = 0
             self.previous_e0_cond = modulated_inp.clone()
-        elif self.cnt%3==1: # drop_text
+        elif self.cnt % 3 == 1:  # drop_text
             if self.cnt < self.ret_steps or self.cnt >= self.cutoff_steps:
                 should_calc_drop_text = True
                 self.accumulated_rel_l1_distance_drop_text = 0
@@ -348,7 +405,7 @@ def usp_dit_forward_multitalk(
                     should_calc_drop_text = True
                     self.accumulated_rel_l1_distance_drop_text = 0
             self.previous_e0_drop_text = modulated_inp.clone()
-        else: # uncond
+        else:  # uncond
             if self.cnt < self.ret_steps or self.cnt >= self.cutoff_steps:
                 should_calc_uncond = True
                 self.accumulated_rel_l1_distance_uncond = 0
@@ -367,47 +424,79 @@ def usp_dit_forward_multitalk(
         x, get_sequence_parallel_world_size(),
         dim=1)[get_sequence_parallel_rank()]
 
+    if self.freqs_list is None:
+        c = (self.dim // self.num_heads) // 2
+        s = x.shape[1]
+        freqs = self.freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+        freqs_list = []
+
+        for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+            seq_len = f * h * w
+
+            freqs_i = torch.cat([
+                freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+            ],
+                dim=-1).reshape(seq_len, 1, -1)
+
+            # apply rotary embedding
+            sp_size = get_sequence_parallel_world_size()
+            sp_rank = get_sequence_parallel_rank()
+            freqs_i = pad_freqs(freqs_i, s * sp_size)
+            s_per_rank = s
+            freqs_i_rank = freqs_i[(sp_rank * s_per_rank):((sp_rank + 1) *
+                                                           s_per_rank), :, :]
+            cos, sin = torch.chunk(torch.view_as_real(freqs_i_rank.to(torch.complex64)), 2, dim=-1)
+            cos = cos.unsqueeze(0).expand(-1, -1, -1, -1, 2).flatten(-2).to(torch.bfloat16)
+            sin = sin.unsqueeze(0).expand(-1, -1, -1, -1, 2).flatten(-2).to(torch.bfloat16)
+            freqs_i_rank = (cos, sin)
+            freqs_list.append(freqs_i_rank)
+        self.freqs_list = freqs_list
+
     # arguments
     kwargs = dict(
         e=e0,
         seq_lens=seq_lens,
         grid_sizes=grid_sizes,
-        freqs=self.freqs,
+        freqs=self.freqs_list,
         context=context,
         context_lens=context_lens,
         audio_embedding=audio_embedding,
         ref_target_masks=token_ref_target_masks,
         human_num=human_num,
-        )
+        rainfusion_config=self.rainfusion_config,
+        t_idx=t_idx,
+    )
 
     if self.enable_teacache:
-        if self.cnt%3==0:
+        if self.cnt % 3 == 0:
             if not should_calc_cond:
-                x +=  self.previous_residual_cond
+                x += self.previous_residual_cond
             else:
                 ori_x = x.clone()
-                for block in self.blocks:
-                    x = block(x, **kwargs)
+                for b_idx, block in enumerate(self.blocks):
+                    x = block(x, b_idx=b_idx, **kwargs)
                 self.previous_residual_cond = x - ori_x
-        elif self.cnt%3==1:
+        elif self.cnt % 3 == 1:
             if not should_calc_drop_text:
-                x +=  self.previous_residual_drop_text
+                x += self.previous_residual_drop_text
             else:
                 ori_x = x.clone()
-                for block in self.blocks:
-                    x = block(x, **kwargs)
+                for b_idx, block in enumerate(self.blocks):
+                    x = block(x, b_idx=b_idx, **kwargs)
                 self.previous_residual_drop_text = x - ori_x
         else:
             if not should_calc_uncond:
-                x +=  self.previous_residual_uncond
+                x += self.previous_residual_uncond
             else:
                 ori_x = x.clone()
-                for block in self.blocks:
-                    x = block(x, **kwargs)
+                for b_idx, block in enumerate(self.blocks):
+                    x = block(x, b_idx=b_idx, **kwargs)
                 self.previous_residual_uncond = x - ori_x
     else:
-        for block in self.blocks:
-            x = block(x, **kwargs)
+        for b_idx, block in enumerate(self.blocks):
+            x = block(x, b_idx=b_idx, **kwargs)
 
     # head
     x = self.head(x, e)
@@ -421,7 +510,7 @@ def usp_dit_forward_multitalk(
         self.cnt += 1
         if self.cnt >= self.num_steps:
             self.cnt = 0
-        
+
     return torch.stack(x).float()
 
 
@@ -431,7 +520,12 @@ def usp_attn_forward_multitalk(self,
                      grid_sizes,
                      freqs,
                      dtype=torch.bfloat16,
-                     ref_target_masks=None):
+                     ref_target_masks=None,
+                     rainfusion_config=None, 
+                     t_idx=0,
+                     b_idx=0,
+    ):
+    #print(f"xdit_context_parallel.py:usp_attn_forward_multitalk:t_idx{t_idx} b_idx:{b_idx}")
     b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
     half_dtypes = (torch.float16, torch.bfloat16)
 
@@ -449,13 +543,32 @@ def usp_attn_forward_multitalk(self,
     q = rope_apply(q, grid_sizes, freqs)
     k = rope_apply(k, grid_sizes, freqs)
 
+    ############################################################################################################
+    # 为了优化 multitalk_utils.py:get_attn_map_with_target 中的zeros初始化步骤，对x_ref_attn_maps进行了持久化保存，
+    # 但是此处假设了q的shape是固定值，后续可能需要推算q的shape，或者进行更好的首轮推理的判断
+    _, seq_lens, heads, _ = q.shape
+    class_num, _ = ref_target_masks.shape
+    #print(f"outside - q.device: {q.device}, q.dtype: {q.dtype}, class_num:{class_num}, seq_lens:{seq_lens}")
+    # if not hasattr(self, 'x_ref_attn_maps_cache'):# or self.x_ref_attn_maps_cache.shape != (class_num, seq_lens):
+    #     self.x_ref_attn_maps_cache = torch.zeros(class_num, seq_lens, device=q.device, dtype=torch.bfloat16)
+    if (class_num, seq_lens, q.device, q.dtype) in self.x_ref_attn_maps_cache:
+        x_ref_attn_maps = self.x_ref_attn_maps_cache[(class_num, seq_lens, q.device, q.dtype)]
+    else:
+        #print("create zeros")
+        x_ref_attn_maps = torch.zeros(class_num, seq_lens, device=q.device, dtype=q.dtype)
+        self.x_ref_attn_maps_cache[(class_num, seq_lens, q.device, q.dtype)] = x_ref_attn_maps
+    ############################################################################################################
 
-    x = xFuserLongContextAttention()(
+
+    x = xFuserLongContextAttention(attn_type=AttnType.NPU, rainfusion_config=rainfusion_config)(
         None,
         query=half(q),
         key=half(k),
         value=half(v),
-        window_size=self.window_size)
+        window_size=self.window_size,
+        t_idx=t_idx,
+        b_idx=b_idx,
+    )
 
 
     # output
@@ -463,22 +576,24 @@ def usp_attn_forward_multitalk(self,
     x = self.o(x)
 
     with torch.no_grad():
-        x_ref_attn_map = get_attn_map_with_target(q.type_as(x), k.type_as(x), grid_sizes[0], 
-                                            ref_target_masks=ref_target_masks, enable_sp=True) 
+        x_ref_attn_map = get_attn_map_with_target(q.type_as(x), k.type_as(x), grid_sizes[0], x_ref_attn_maps,
+                                            ref_target_masks=ref_target_masks, enable_sp=True)
+        # x_ref_attn_map = get_attn_map_with_target(q.type_as(x), k.type_as(x), grid_sizes[0],
+        #                                     ref_target_masks=ref_target_masks, enable_sp=True)
 
     return x, x_ref_attn_map
 
 
 
 
-def usp_crossattn_multi_forward_multitalk(self, 
-                                        x: torch.Tensor, 
+def usp_crossattn_multi_forward_multitalk(self,
+                                        x: torch.Tensor,
                                         encoder_hidden_states: torch.Tensor,  # 1, 21, 64, C
-                                        shape=None, 
+                                        shape=None,
                                         x_ref_attn_map=None,
                                         human_num=None) -> torch.Tensor:
-        
-        N_t, N_h, N_w = shape 
+
+        N_t, N_h, N_w = shape
         sp_size = get_sequence_parallel_world_size()
         sp_rank = get_sequence_parallel_rank()
         audio_tokens_per_frame = 32
@@ -494,15 +609,15 @@ def usp_crossattn_multi_forward_multitalk(self,
 
         # get q for hidden_state
         B, N, C = x.shape
-        q = self.q_linear(x) 
-        q_shape = (B, N, self.num_heads, self.head_dim) 
+        q = self.q_linear(x)
+        q_shape = (B, N, self.num_heads, self.head_dim)
         q = q.view(q_shape).permute((0, 2, 1, 3))
 
         if self.qk_norm:
             q = self.q_norm(q)
 
-        max_values = x_ref_attn_map.max(1).values[:, None, None] 
-        min_values = x_ref_attn_map.min(1).values[:, None, None] 
+        max_values = x_ref_attn_map.max(1).values[:, None, None]
+        min_values = x_ref_attn_map.min(1).values[:, None, None]
         max_min_values = torch.cat([max_values, min_values], dim=2)
         max_min_values = get_sp_group().all_gather(max_min_values, dim=1)
 
@@ -514,12 +629,12 @@ def usp_crossattn_multi_forward_multitalk(self,
         back   = torch.full((x_ref_attn_map.size(1),), self.rope_bak, dtype=human1.dtype).to(human1.device)
         max_indices = x_ref_attn_map.argmax(dim=0)
         normalized_map = torch.stack([human1, human2, back], dim=1)
-        normalized_pos = normalized_map[range(x_ref_attn_map.size(1)), max_indices] # N 
+        normalized_pos = normalized_map[range(x_ref_attn_map.size(1)), max_indices] # N
         q = self.rope_1d(q, normalized_pos)
- 
-        encoder_kv = self.kv_linear(encoder_hidden_states) 
+
+        encoder_kv = self.kv_linear(encoder_hidden_states)
         encoder_kv_shape = (B, encoder_hidden_states.size(1), 2, self.num_heads, self.head_dim)
-        encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4)) 
+        encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4))
         encoder_k, encoder_v = encoder_kv.unbind(0) # B H N C
 
         if self.qk_norm:
@@ -536,15 +651,49 @@ def usp_crossattn_multi_forward_multitalk(self,
         q = rearrange(q, "B H M K -> B M H K")
         encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
         encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
-        attn_bias = xformers.ops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(visual_seqlen, kv_seq)
-        x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=attn_bias, op=None,)
+
+        # ========= 新增：构建 SDPA block-diagonal mask =========
+        # SDPA: True 表示 mask 掉（不能 attend）
+        total_q = sum(visual_seqlen)
+        total_k = sum(kv_seq)
+
+        attn_mask = torch.ones(
+            (total_q, total_k),
+            dtype=torch.bool,
+            device=q.device,
+        )
+
+        q_starts = [0]
+        for l in visual_seqlen[:-1]:
+            q_starts.append(q_starts[-1] + l)
+
+        k_starts = [0]
+        for l in kv_seq[:-1]:
+            k_starts.append(k_starts[-1] + l)
+
+        for qs, ql, ks, kl in zip(q_starts, visual_seqlen, k_starts, kv_seq):
+            attn_mask[qs:qs + ql, ks:ks + kl] = False
+
+        # (B, 1, M, K) —— SDPA 可广播
+        attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
+
+        # ========= SDPA =========
+        x = torch.nn.functional.scaled_dot_product_attention(
+            q,  # (B, M, H, K)
+            encoder_k,
+            encoder_v,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=False,
+        )
+        # 修改完成
         x = rearrange(x, "B M H K -> B H M K")
 
         # linear transform
         x_output_shape = (B, N, C)
-        x = x.transpose(1, 2) 
-        x = x.reshape(x_output_shape) 
-        x = self.proj(x) 
+        x = x.transpose(1, 2)
+        x = x.reshape(x_output_shape)
+        x = self.proj(x)
         x = self.proj_drop(x)
 
         return x
